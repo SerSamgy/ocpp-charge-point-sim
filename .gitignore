@@ -1,0 +1,20 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[oc]
+.venv/
+
+# Private notes and third-party specs (not redistributable)
+docs/journal/
+docs/specs/
+
+# Secrets
+*.pem
+*.key
+.env*
+
+# Editor config
+.helix/
