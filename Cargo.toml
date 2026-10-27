@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/cp-sim"]
+members = ["crates/cp-sim", "crates/cp-blink"]
 
 [workspace.package]
 edition = "2024"
