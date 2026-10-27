@@ -32,6 +32,7 @@ for Pi builds, [uv](https://github.com/astral-sh/uv) for the CSMS.
 
 ```sh
 just test       # Rust tests for the whole workspace
+just ci         # everything CI runs, except the commit message check
 just csms       # start the test CSMS on ws://0.0.0.0:9000/<charge_point_id>
 just build-pi   # static aarch64 musl binaries in target/aarch64-unknown-linux-musl/release/
 just deploy     # scp the cp-sim binary to $PI_HOST (default: cp-sim)
@@ -50,3 +51,18 @@ force-push, skipping the commit hook, reading credentials).
 
 Personal overrides go into `.claude/settings.local.json`, which is gitignored.
 Rationale and known limitations: `docs/decisions/0005-agent-permission-policy.md`.
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request and on pushes to
+`main`. Three jobs:
+
+| Job | Checks | Local |
+|---|---|---|
+| `rust` | `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo check` for `aarch64-unknown-linux-musl` | `just ci-rust` |
+| `python` | `ruff check` and `ruff format --check` in `csms/` | `just ci-python` |
+| `commits` | every non-merge commit of the PR passes `.githooks/commit-msg` | the hook itself |
+
+The `rust` and `python` jobs call the same `just` recipes as `just ci`, so
+local and CI checks cannot drift. Design and security choices:
+`docs/decisions/0006-ci-on-github-actions.md`.

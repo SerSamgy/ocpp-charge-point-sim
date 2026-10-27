@@ -57,7 +57,6 @@ Found during the migration inventory; carried over as is
 - [ ] Structured logging with `tracing` instead of `println!`.
 - [ ] Fix the test name typo `cpms` in `boot_response_parses_cpms_response`.
 - [ ] `csms`: write the README and the `pyproject.toml` description.
-- [ ] Validate commit messages in CI too (the local hook can be bypassed).
 - [ ] Let crates inherit `edition` from `[workspace.package]`.
 - [ ] Agent permissions, follow-ups to
       `docs/decisions/0005-agent-permission-policy.md`:
@@ -68,6 +67,15 @@ Found during the migration inventory; carried over as is
   - [ ] ask or deny `rsync`, `sftp`, `uv remove|sync`;
   - [ ] check how the Code tab of Claude Desktop applies the rules
         (manual checklist in the pull request that added them).
+
+- [ ] CI follow-ups, see `docs/decisions/0006-ci-on-github-actions.md`:
+  - [ ] Dependabot: `.github/dependabot.yml` for `cargo`, `uv` and
+        `github-actions`, commit prefix `build(deps):`;
+  - [ ] CodeQL default setup;
+  - [ ] end-to-end CI test cp-sim ↔ csms: needs a client mode that
+        connects, completes Boot, sends one Heartbeat and exits;
+  - [ ] OS-level sandboxing for the coding agent (the Bash sandbox, see
+        the permission follow-ups above).
 
 ## Later scope
 

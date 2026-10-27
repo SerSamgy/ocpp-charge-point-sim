@@ -197,6 +197,10 @@ mod tests {
 
     // --- Fake CSMS: a one-connection WebSocket server driven by the test ---
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "the signature is dictated by tungstenite's handshake `Callback` impl for closures, so the large `Err` variant cannot be boxed"
+    )]
     fn echo_ocpp16(_req: &HsRequest, mut resp: Response) -> Result<Response, ErrorResponse> {
         resp.headers_mut().insert(
             "Sec-WebSocket-Protocol",
