@@ -1,45 +1,61 @@
 # Roadmap
 
 Two tracks move in parallel: the OCPP protocol client and the hardware
-of the simulated charge point. Steps are numbered across both tracks.
+and system side of the simulated charge point. Steps are numbered across
+both tracks. Status: **done**, **in progress** or **not started**.
 
-## OCPP track
+## Protocol track
 
-### Done
+1. **Done.** Python test CSMS (`csms/`), OCPP 1.6.
+2. **Done.** BootNotification and Heartbeat in the Rust client
+   (`crates/cp-sim`); runs on the laptop and on the Pi.
+3. **In progress.** Protocol core.
+   - [x] OCPP-J `Frame` (CALL, CALLRESULT, CALLERROR)
+   - [x] typed messages (`Request` trait with action and response type)
+   - [x] response matching by message ID
+   - [x] replies to server-initiated CALLs (CALLERROR `NotImplemented`)
+   - [x] cargo workspace (done by the migration)
+   - [ ] **3e.** Retry BootNotification on `Rejected` / `Pending`,
+         reconnect with backoff, connection timeout, guard against
+         `interval = 0`.
+   - [ ] **3f.** Graceful shutdown on Ctrl+C.
+4. **Not started.** Connector state machine: Available → Preparing →
+   Charging → Finishing → Available, plus Faulted. StatusNotification on
+   every transition. Events come from the keyboard for now.
+5. **Not started.** Transactions: Authorize, StartTransaction,
+   StopTransaction, MeterValues with a simulated energy meter.
 
-- **Step 1.** Python test CSMS (`csms/`), OCPP 1.6, BootNotification and
-  Heartbeat.
-- **Step 2.** Rust client (`crates/cp-sim`) with BootNotification and
-  Heartbeat; runs on the laptop and on the Pi.
+## Hardware and system track
 
-### In progress
+6. **Done.** LED on GPIO via `rppal`.
+7. **Done.** Four buttons, debouncing, polling vs interrupts. See
+   `docs/hardware/`.
+8. **Not started.** Join the tracks: buttons become state machine events
+   via Tokio channels, LEDs show connector status. Requires 4, 6, 7.
+9. **Not started.** Debug Probe and the serial console of the Pi over
+   UART.
+10. **Not started.** Autostart as a systemd service.
 
-- **Step 3.** Robust client.
-  - [x] typed serde messages (`Request` trait with action and response type)
-  - [x] response matching by message ID
-  - [x] CALLERROR handling
-  - [ ] reconnect with backoff
-  - [ ] clean shutdown on Ctrl+C
+## Suggested order
 
-### Next
+3e → 3f → 4 → 8 → 5 → 10; 9 at any time.
 
-- Finish step 3.
+## Larger blocks after that
 
-## Hardware track
+- **OCPP 2.0.1.** TransactionEvent instead of Start/StopTransaction,
+  device model, an abstraction supporting both versions (the natural
+  point to extract the `ocpp-proto` crate).
+- **Security profiles.** Basic auth over TLS, then client certificates
+  (mTLS).
+- **Relay as contactor.** Module choice postponed until the enclosure and
+  fan are decided.
+- **Control Pilot.** A microcontroller generating the IEC 61851 signal,
+  connected to the Pi over UART.
 
-### Done
+## Postponed purchases
 
-- **Step 6.** LED on GPIO blinking from Rust via `rppal`.
-- **Step 7.** Four buttons as simulator events, debouncing, polling vs
-  interrupts. See `docs/hardware/`.
-
-### In progress
-
-- Nothing.
-
-### Next
-
-- **Step 8.** Button events into Tokio alongside the OCPP client.
+- Relay module.
+- RTC battery for the Pi.
 
 ## Backlog
 
@@ -47,9 +63,9 @@ Found during the migration inventory; carried over as is
 (see `docs/decisions/0002-as-is-migration.md`).
 
 - [ ] Handle `interval = 0` from the server (`tokio::time::interval`
-      panics today).
+      panics today). Part of step 3e.
 - [ ] Retry BootNotification after `interval` on `Pending` / `Rejected`
-      instead of exiting.
+      instead of exiting. Part of step 3e.
 - [ ] A failing Heartbeat (timeout, CALLERROR) should not exit the program.
 - [ ] Extract an `ocpp-proto` library crate (see `docs/archive/`).
 - [ ] Turn `cp-blink` into a hardware library (pin table, `Button`,
@@ -67,7 +83,6 @@ Found during the migration inventory; carried over as is
   - [ ] ask or deny `rsync`, `sftp`, `uv remove|sync`;
   - [ ] check how the Code tab of Claude Desktop applies the rules
         (manual checklist in the pull request that added them).
-
 - [ ] CI follow-ups, see `docs/decisions/0006-ci-on-github-actions.md`:
   - [ ] Dependabot: `.github/dependabot.yml` for `cargo`, `uv` and
         `github-actions`, commit prefix `build(deps):`;
@@ -76,11 +91,3 @@ Found during the migration inventory; carried over as is
         connects, completes Boot, sends one Heartbeat and exits;
   - [ ] OS-level sandboxing for the coding agent (the Bash sandbox, see
         the permission follow-ups above).
-
-## Later scope
-
-- OCPP 2.0.1.
-- TLS and client certificates (OCPP security profiles).
-- A relay as the contactor.
-- A microcontroller generating the IEC 61851 Control Pilot signal,
-  connected to the Pi over UART.
