@@ -2,12 +2,19 @@
 
 ## Project
 
-An OCPP 1.6 charge point simulator in Rust + Tokio. It runs on a laptop
+An OCPP charge point simulator in Rust + Tokio. It runs on a laptop
 and on a Raspberry Pi 5 acting as the "charge controller"; a small Python
 CSMS (the OCPP server) is used for testing. This is a learning project:
 the owner learns Rust, embedded Linux and hardware by reviewing
 agent-written code and reading the explanations. Explanations matter as
 much as the code.
+
+The client speaks OCPP 1.6 today; 2.0.1 is planned (see the roadmap).
+Do not hard-wire 1.6 where a second version will plug in.
+
+OCPP specifications live in `docs/specs/` (local, gitignored). Check
+protocol details against them, not memory; if the needed spec is
+missing, say so.
 
 Layout:
 
