@@ -45,6 +45,7 @@ both tracks. Status: **done**, **in progress** or **not started**.
 - **OCPP 2.0.1.** TransactionEvent instead of Start/StopTransaction,
   device model, an abstraction supporting both versions (the natural
   point to extract the `ocpp-proto` crate).
+- **OCPP 2.1 (optional, after 2.0.1).** Extends 2.0.1, e.g. V2X.
 - **Security profiles.** Basic auth over TLS, then client certificates
   (mTLS).
 - **Relay as contactor.** Module choice postponed until the enclosure and
@@ -70,6 +71,8 @@ Found during the migration inventory; carried over as is
 - [ ] Extract an `ocpp-proto` library crate (see `docs/archive/`).
 - [ ] Turn `cp-blink` into a hardware library (pin table, `Button`,
       debounce) with the experiments as examples.
+- [ ] Validate serialized messages against the official JSON schemas in
+      tests.
 - [ ] Structured logging with `tracing` instead of `println!`.
 - [ ] Fix the test name typo `cpms` in `boot_response_parses_cpms_response`.
 - [ ] `csms`: write the README and the `pyproject.toml` description.
