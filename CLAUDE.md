@@ -41,16 +41,21 @@ Layout:
 - One task = one branch = one PR, sized for one or two evenings. Branch
   name `<type>/<short-slug>`, e.g. `feat/boot-retry`.
 - Non-trivial task: explore, propose a plan (plan mode when available),
-  wait for approval before editing files.
+  wait for approval before editing files. If the task clearly exceeds one
+  or two evenings, propose splitting it.
+- Out-of-scope findings go to the roadmap backlog, not into the PR.
 - Small commits, one logical change each. The workspace builds and tests
   pass after every commit. Refactoring is separate from behaviour changes.
 - Conventional Commits, validated by `.githooks/commit-msg`. The body
   explains why. End with a `Co-Authored-By` trailer for the model used.
 - Every behaviour change comes with tests; tests are the specification.
+- A new OCPP message also gets a handler in `csms/`; check it end-to-end
+  locally against `just csms`.
 - Run `just ci` before every push. Never use `--no-verify`.
 - Push and PR creation need the owner's confirmation. Never merge, never
   force-push, never rewrite pushed history: the owner merges with merge
   commits and the journal references commit hashes.
+- PR body in English: summary, why, how to verify.
 - After opening a PR, wait for CI with `gh pr checks` and fix failures
   with new commits.
 - Update `docs/roadmap.md` when a task changes its status. Write an ADR in
