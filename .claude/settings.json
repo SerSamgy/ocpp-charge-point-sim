@@ -50,6 +50,7 @@
       "Edit(.claude/**)",
       "Edit(justfile)",
       "Edit(.githooks/**)",
+      "Edit(.github/workflows/**)",
       "Edit(**/build.rs)",
       "Bash(curl *)",
       "Bash(wget *)"
