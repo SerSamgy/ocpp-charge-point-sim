@@ -20,3 +20,18 @@ deploy:
 # Start the Python test CSMS on port 9000
 csms:
     cd csms && uv run main.py
+
+# Everything CI runs on a pull request, except the commit message check
+ci: ci-rust ci-python
+
+# CI job `rust`: format, lints, tests, Pi target check
+ci-rust:
+    cargo fmt --check
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo test --workspace
+    cargo check --workspace --target aarch64-unknown-linux-musl
+
+# CI job `python`: ruff lint and format check for the test CSMS
+ci-python:
+    cd csms && uv run ruff check
+    cd csms && uv run ruff format --check
