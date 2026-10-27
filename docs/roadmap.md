@@ -59,6 +59,15 @@ Found during the migration inventory; carried over as is
 - [ ] `csms`: write the README and the `pyproject.toml` description.
 - [ ] Validate commit messages in CI too (the local hook can be bypassed).
 - [ ] Let crates inherit `edition` from `[workspace.package]`.
+- [ ] Agent permissions, follow-ups to
+      `docs/decisions/0005-agent-permission-policy.md`:
+  - [ ] evaluate enabling the Claude Code Bash sandbox (filesystem and
+        network limits for shell commands);
+  - [ ] close short-form gaps: `git push -fu`, `+refspec` pushes,
+        `git branch -D`, `git switch -f`, `git commit -vn`;
+  - [ ] ask or deny `rsync`, `sftp`, `uv remove|sync`;
+  - [ ] check how the Code tab of Claude Desktop applies the rules
+        (manual checklist in the pull request that added them).
 
 ## Later scope
 

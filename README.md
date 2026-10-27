@@ -38,3 +38,15 @@ just deploy     # scp the cp-sim binary to $PI_HOST (default: cp-sim)
 ```
 
 Run the client against a CSMS: `cargo run -p cp-sim -- ws://localhost:9000/CP001`.
+
+## Coding agent permissions
+
+`.claude/settings.json` is the shared project settings file of
+[Claude Code](https://code.claude.com/docs/en/settings). It defines what the
+coding agent may do in this repository: which commands run without asking
+(build, test, local git, read-only `gh`), which need confirmation (push, PR
+creation, dependency changes, deploy) and which are denied (merging,
+force-push, skipping the commit hook, reading credentials).
+
+Personal overrides go into `.claude/settings.local.json`, which is gitignored.
+Rationale and known limitations: `docs/decisions/0005-agent-permission-policy.md`.
