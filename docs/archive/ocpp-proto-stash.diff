@@ -1,0 +1,664 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index c3219cb..9fc8ff1 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -57,6 +57,7 @@ name = "cp-sim"
+ version = "0.1.0"
+ dependencies = [
+  "futures-util",
++ "ocpp-proto",
+  "serde_json",
+  "tokio",
+  "tokio-tungstenite",
+@@ -231,6 +232,15 @@ dependencies = [
+  "windows-sys",
+ ]
+ 
++[[package]]
++name = "ocpp-proto"
++version = "0.1.0"
++dependencies = [
++ "serde",
++ "serde_json",
++ "thiserror",
++]
++
+ [[package]]
+ name = "once_cell"
+ version = "1.21.4"
+@@ -335,6 +345,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "4148590afebada386688f18773da617792bf2ef03ffc1e4cbd2b1d45b023e0ba"
+ dependencies = [
+  "serde_core",
++ "serde_derive",
+ ]
+ 
+ [[package]]
+diff --git a/Cargo.toml b/Cargo.toml
+index 464d877..eb941b8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -1,11 +1,12 @@
+-[package]
+-name = "cp-sim"
+-version = "0.1.0"
++[workspace]
++resolver = "3"
++members = ["crates/ocpp-proto", "crates/cp-sim"]
++
++[workspace.package]
+ edition = "2024"
++version = "0.1.0"
+ 
+-[dependencies]
+-futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+-serde_json = "1.0.151"
+-tokio = { version = "1.53.1", features = ["full"] }
+-tokio-tungstenite = "0.30.0"
+-uuid = { version = "1.26.1", features = ["v4"] }
++[workspace.dependencies]
++serde = { version = "1", features = ["derive"] }
++serde_json = "1"
++thiserror = "2"
+diff --git a/crates/cp-sim/Cargo.toml b/crates/cp-sim/Cargo.toml
+new file mode 100644
+index 0000000..2390b06
+--- /dev/null
++++ b/crates/cp-sim/Cargo.toml
+@@ -0,0 +1,12 @@
++[package]
++name = "cp-sim"
++version.workspace = true
++edition.workspace = true
++
++[dependencies]
++futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
++serde_json = "1.0.151"
++tokio = { version = "1.53.1", features = ["full"] }
++tokio-tungstenite = "0.30.0"
++uuid = { version = "1.26.1", features = ["v4"] }
++ocpp-proto = { path = "../ocpp-proto" }
+diff --git a/crates/cp-sim/src/main.rs b/crates/cp-sim/src/main.rs
+new file mode 100644
+index 0000000..d45a8b7
+--- /dev/null
++++ b/crates/cp-sim/src/main.rs
+@@ -0,0 +1,128 @@
++use std::{error::Error, time::Duration};
++
++use futures_util::{SinkExt, StreamExt};
++use ocpp_proto::{
++    Frame,
++    v16::{BootNotificationRequest, BootNotificationResponse, HeartbeatRequest, RegistrationStatus},
++};
++use tokio_tungstenite::{
++    connect_async,
++    tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
++};
++use uuid::Uuid;
++
++const DEFAULT_CSMS_URL: &str = "ws://localhost:9000/CP001";
++
++/// Frame -> WebSocket text message, with logging in one place.
++fn to_msg(frame: &Frame) -> Message {
++    let text = frame.to_json();
++    println!(">> {text}");
++    Message::text(text)
++}
++
++fn new_id() -> String {
++    Uuid::new_v4().to_string()
++}
++
++#[tokio::main]
++async fn main() -> Result<(), Box<dyn Error>> {
++    let url = std::env::args()
++        .nth(1)
++        .unwrap_or_else(|| DEFAULT_CSMS_URL.to_string());
++
++    // --- 1. Connect with sub-protocol ocpp1.6 ---
++    let mut request = url.as_str().into_client_request()?;
++    request
++        .headers_mut()
++        .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("ocpp1.6"));
++    let (ws, _response) = connect_async(request).await?;
++    println!("Connected to {url}");
++
++    let (mut write, mut read) = ws.split();
++
++    // --- 2. BootNotification ---
++    let req = BootNotificationRequest {
++        charge_point_vendor: "Semyon".into(),
++        charge_point_model: "cp-sim".into(),
++        ..Default::default()
++    };
++    let boot_id = new_id();
++    write.send(to_msg(&Frame::call(&boot_id, &req)?)).await?;
++
++    let boot: BootNotificationResponse = loop {
++        let Some(msg) = read.next().await else {
++            return Err("connection closed before BootNotification response".into());
++        };
++        let Message::Text(text) = msg? else { continue };
++        println!("<< {text}");
++
++        let frame = match Frame::parse(text.as_str()) {
++            Ok(f) => f,
++            Err(e) => {
++                eprintln!("bad frame, ignored: {e}");
++                continue;
++            }
++        };
++        match frame {
++            Frame::CallResult { id, payload } if id == boot_id => {
++                break serde_json::from_value(payload)?;
++            }
++            Frame::CallError { id, code, description, .. } if id == boot_id => {
++                return Err(format!("BootNotification failed: {code}: {description}").into());
++            }
++            other => eprintln!("unexpected before boot, ignored: {other:?}"),
++        }
++    };
++
++    if boot.status != RegistrationStatus::Accepted {
++        // Step 3c: retry after boot.interval instead of exiting
++        return Err(format!("boot not accepted: {:?}", boot.status).into());
++    }
++    // tokio::time::interval panics on a zero period, and interval=0 is legal on the wire
++    let interval_secs = u64::from(boot.interval.max(1));
++    println!("accepted, heartbeat every {interval_secs}s");
++
++    // --- 3. Heartbeat + input read simultaneously ---
++    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
++    ticker.tick().await; // first tick fires immediately — skip it
++
++    loop {
++        tokio::select! {
++            _ = ticker.tick() => {
++                write.send(to_msg(&Frame::call(new_id(), &HeartbeatRequest {})?)).await?;
++            }
++            msg = read.next() => {
++                match msg {
++                    Some(Ok(Message::Text(text))) => {
++                        println!("<< {text}");
++                        match Frame::parse(text.as_str()) {
++                            // Request from the server: nothing is supported yet
++                            Ok(Frame::Call { id, action, .. }) => {
++                                let reply = Frame::error(id, "NotImplemented", &format!("{action} is not supported"));
++                                write.send(to_msg(&reply)).await?;
++                            }
++                            // Responses (Heartbeat etc.): routing by ID comes in step 3b
++                            Ok(Frame::CallResult { .. }) => {}
++                            Ok(Frame::CallError { id, code, description, .. }) => {
++                                eprintln!("CALLERROR for {id}: {code}: {description}");
++                            }
++                            Err(e) => eprintln!("bad frame, ignored: {e}"),
++                        }
++                    }
++                    Some(Ok(Message::Close(frame))) => {
++                        println!("server closed connection: {frame:?}");
++                        break;
++                    }
++                    Some(Ok(_)) => {} // ping/pong/binary — tungstenite answers ping itself
++                    Some(Err(e)) => return Err(e.into()),
++                    None => {
++                        println!("connection closed");
++                        break;
++                    }
++                }
++            }
++        }
++    }
++
++    Ok(())
++}
+diff --git a/crates/ocpp-proto/Cargo.toml b/crates/ocpp-proto/Cargo.toml
+new file mode 100644
+index 0000000..6cc58cb
+--- /dev/null
++++ b/crates/ocpp-proto/Cargo.toml
+@@ -0,0 +1,9 @@
++[package]
++name = "ocpp-proto"
++version.workspace = true
++edition.workspace = true
++
++[dependencies]
++serde.workspace = true
++serde_json.workspace = true
++thiserror.workspace = true
+diff --git a/crates/ocpp-proto/src/frame.rs b/crates/ocpp-proto/src/frame.rs
+new file mode 100644
+index 0000000..9174d09
+--- /dev/null
++++ b/crates/ocpp-proto/src/frame.rs
+@@ -0,0 +1,240 @@
++//! OCPP-J RPC framing: every message — JSON-array.
++//!   CALL:       [2, "<id>", "<Action>", {payload}]
++//!   CALLRESULT: [3, "<id>", {payload}]
++//!   CALLERROR:  [4, "<id>", "<ErrorCode>", "<description>", {details}]
++
++use crate::Request;
++use serde::de::{self, Deserializer};
++use serde::ser::{SerializeSeq, Serializer};
++use serde::{Deserialize, Serialize};
++use serde_json::Value;
++
++const CALL: u8 = 2;
++const CALL_RESULT: u8 = 3;
++const CALL_ERROR: u8 = 4;
++
++#[derive(Debug, Clone, PartialEq)]
++pub enum Frame {
++    Call {
++        id: String,
++        action: String,
++        payload: Value,
++    },
++    CallResult {
++        id: String,
++        payload: Value,
++    },
++    CallError {
++        id: String,
++        code: String,
++        description: String,
++        details: Value,
++    },
++}
++
++#[derive(Debug, thiserror::Error)]
++pub enum FrameError {
++    #[error("invalid JSON: {0}")]
++    Json(#[from] serde_json::Error),
++}
++
++impl Frame {
++    /// Собрать CALL из типизированного запроса.
++    pub fn call<R: Request>(id: impl Into<String>, req: &R) -> Result<Self, FrameError> {
++        Ok(Frame::Call {
++            id: id.into(),
++            action: R::ACTION.to_string(),
++            payload: serde_json::to_value(req)?,
++        })
++    }
++
++    /// Собрать CALLRESULT в ответ на запрос сервера.
++    pub fn result<T: Serialize>(id: impl Into<String>, resp: &T) -> Result<Self, FrameError> {
++        Ok(Frame::CallResult {
++            id: id.into(),
++            payload: serde_json::to_value(resp)?,
++        })
++    }
++
++    /// Собрать CALLERROR (например, NotImplemented на неизвестный action).
++    pub fn error(id: impl Into<String>, code: &str, description: &str) -> Self {
++        Frame::CallError {
++            id: id.into(),
++            code: code.to_string(),
++            description: description.to_string(),
++            details: Value::Object(Default::default()),
++        }
++    }
++
++    pub fn id(&self) -> &str {
++        match self {
++            Frame::Call { id, .. } | Frame::CallResult { id, .. } | Frame::CallError { id, .. } => {
++                id
++            }
++        }
++    }
++
++    pub fn parse(text: &str) -> Result<Self, FrameError> {
++        Ok(serde_json::from_str(text)?)
++    }
++
++    pub fn to_json(&self) -> String {
++        // Сериализация Frame не может упасть: внутри только строки и Value.
++        serde_json::to_string(self).expect("Frame serialization is infallible")
++    }
++}
++
++impl Serialize for Frame {
++    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
++        match self {
++            Frame::Call {
++                id,
++                action,
++                payload,
++            } => {
++                let mut seq = s.serialize_seq(Some(4))?;
++                seq.serialize_element(&CALL)?;
++                seq.serialize_element(id)?;
++                seq.serialize_element(action)?;
++                seq.serialize_element(payload)?;
++                seq.end()
++            }
++            Frame::CallResult { id, payload } => {
++                let mut seq = s.serialize_seq(Some(3))?;
++                seq.serialize_element(&CALL_RESULT)?;
++                seq.serialize_element(id)?;
++                seq.serialize_element(payload)?;
++                seq.end()
++            }
++            Frame::CallError {
++                id,
++                code,
++                description,
++                details,
++            } => {
++                let mut seq = s.serialize_seq(Some(5))?;
++                seq.serialize_element(&CALL_ERROR)?;
++                seq.serialize_element(id)?;
++                seq.serialize_element(code)?;
++                seq.serialize_element(description)?;
++                seq.serialize_element(details)?;
++                seq.end()
++            }
++        }
++    }
++}
++
++impl<'de> Deserialize<'de> for Frame {
++    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
++        // Сначала читаем массив произвольных JSON-значений, потом разбираем по типу.
++        let arr = Vec::<Value>::deserialize(d)?;
++        let ty = arr
++            .first()
++            .and_then(Value::as_u64)
++            .ok_or_else(|| de::Error::custom("first element must be message type id"))?;
++
++        let str_at = |i: usize, what: &str| -> Result<String, D::Error> {
++            arr.get(i)
++                .and_then(Value::as_str)
++                .map(str::to_owned)
++                .ok_or_else(|| de::Error::custom(format!("element {i} ({what}) must be a string")))
++        };
++        let expect_len = |n: usize| -> Result<(), D::Error> {
++            if arr.len() == n {
++                Ok(())
++            } else {
++                Err(de::Error::custom(format!(
++                    "type {ty}: expected {n} elements, got {}",
++                    arr.len()
++                )))
++            }
++        };
++
++        match ty {
++            2 => {
++                expect_len(4)?;
++                Ok(Frame::Call {
++                    id: str_at(1, "id")?,
++                    action: str_at(2, "action")?,
++                    payload: arr[3].clone(),
++                })
++            }
++            3 => {
++                expect_len(3)?;
++                Ok(Frame::CallResult {
++                    id: str_at(1, "id")?,
++                    payload: arr[2].clone(),
++                })
++            }
++            4 => {
++                expect_len(5)?;
++                Ok(Frame::CallError {
++                    id: str_at(1, "id")?,
++                    code: str_at(2, "errorCode")?,
++                    description: str_at(3, "errorDescription")?,
++                    details: arr[4].clone(),
++                })
++            }
++            other => Err(de::Error::custom(format!(
++                "unknown message type id {other}"
++            ))),
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::v16::{BootNotificationRequest, BootNotificationResponse, RegistrationStatus};
++    use serde_json::json;
++
++    #[test]
++    fn call_roundtrip() {
++        let req = BootNotificationRequest {
++            charge_point_vendor: "Ampeco".into(),
++            charge_point_model: "cp-test".into(),
++            ..Default::default()
++        };
++        let f = Frame::call("42", &req).unwrap();
++        let text = f.to_json();
++        assert_eq!(
++            serde_json::from_str::<Value>(&text).unwrap(),
++            json!([2, "42", "BootNotification", {"chargePointVendor": "Ampeco", "chargePointModel": "cp-test"}])
++        );
++        assert_eq!(Frame::parse(&text).unwrap(), f);
++    }
++
++    #[test]
++    fn parse_call_result_into_typed_response() {
++        let text =
++            r#"[3,"42",{"status":"Accepted","currentTime":"2026-10-02T12:00:00","interval":10}]"#;
++        let Frame::CallResult { id, payload } = Frame::parse(text).unwrap() else {
++            panic!("not a CallResult")
++        };
++        assert_eq!(id, "42");
++        let resp: BootNotificationResponse = serde_json::from_value(payload).unwrap();
++        assert_eq!(resp.status, RegistrationStatus::Accepted);
++        assert_eq!(resp.interval, 10);
++    }
++
++    #[test]
++    fn parse_call_error() {
++        let text = r#"[4,"7","NotImplemented","Unknown action",{}]"#;
++        match Frame::parse(text).unwrap() {
++            Frame::CallError { id, code, .. } => {
++                assert_eq!(id, "7");
++                assert_eq!(code, "NotImplemented");
++            }
++            other => panic!("unexpected {other:?}"),
++        }
++    }
++
++    #[test]
++    fn rejects_garbage() {
++        assert!(Frame::parse("{}").is_err()); // не массив
++        assert!(Frame::parse("[]").is_err()); // пустой
++        assert!(Frame::parse(r#"[9,"1",{}]"#).is_err()); // неизвестный тип
++        assert!(Frame::parse(r#"[3,"1"]"#).is_err()); // не хватает элементов
++        assert!(Frame::parse(r#"[2,1,"Heartbeat",{}]"#).is_err()); // id не строка
++    }
++}
+diff --git a/crates/ocpp-proto/src/lib.rs b/crates/ocpp-proto/src/lib.rs
+new file mode 100644
+index 0000000..544ac99
+--- /dev/null
++++ b/crates/ocpp-proto/src/lib.rs
+@@ -0,0 +1,16 @@
++//! Протокольный слой OCPP: фреймы RPC и типизированные сообщения.
++//! Ничего не знает о сети и Tokio — только данные и (де)сериализация.
++
++pub mod frame;
++pub mod v16;
++
++pub use frame::{Frame, FrameError};
++
++use serde::{de::DeserializeOwned, Serialize};
++
++/// Сообщение-запрос OCPP. Связывает тип запроса с именем action
++/// и с типом ответа, чтобы `call(req)` возвращал правильный тип.
++pub trait Request: Serialize + DeserializeOwned {
++    const ACTION: &'static str;
++    type Response: Serialize + DeserializeOwned;
++}
+diff --git a/crates/ocpp-proto/src/v16/core.rs b/crates/ocpp-proto/src/v16/core.rs
+new file mode 100644
+index 0000000..2d7cd98
+--- /dev/null
++++ b/crates/ocpp-proto/src/v16/core.rs
+@@ -0,0 +1,55 @@
++use crate::Request;
++use serde::{Deserialize, Serialize};
++
++// ---------- BootNotification ----------
++
++#[derive(Debug, Clone, Default, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct BootNotificationRequest {
++    pub charge_point_vendor: String,
++    pub charge_point_model: String,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub charge_point_serial_number: Option<String>,
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub firmware_version: Option<String>,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct BootNotificationResponse {
++    pub status: RegistrationStatus,
++    /// Пока строкой: Python-серверы часто шлют время без часового пояса
++    /// (`datetime.utcnow().isoformat()`), и строгий парсер на этом упадёт.
++    pub current_time: String,
++    /// Секунды. При Accepted — интервал Heartbeat, при Pending/Rejected —
++    /// через сколько повторить BootNotification.
++    pub interval: u32,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
++pub enum RegistrationStatus {
++    Accepted,
++    Pending,
++    Rejected,
++}
++
++impl Request for BootNotificationRequest {
++    const ACTION: &'static str = "BootNotification";
++    type Response = BootNotificationResponse;
++}
++
++// ---------- Heartbeat ----------
++
++#[derive(Debug, Clone, Default, Serialize, Deserialize)]
++pub struct HeartbeatRequest {}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++#[serde(rename_all = "camelCase")]
++pub struct HeartbeatResponse {
++    pub current_time: String,
++}
++
++impl Request for HeartbeatRequest {
++    const ACTION: &'static str = "Heartbeat";
++    type Response = HeartbeatResponse;
++}
+diff --git a/crates/ocpp-proto/src/v16/mod.rs b/crates/ocpp-proto/src/v16/mod.rs
+new file mode 100644
+index 0000000..ec2fdf5
+--- /dev/null
++++ b/crates/ocpp-proto/src/v16/mod.rs
+@@ -0,0 +1,4 @@
++//! OCPP 1.6J. Пока только то, что клиент уже использует.
++
++mod core;
++pub use self::core::*;
+diff --git a/src/main.rs b/src/main.rs
+deleted file mode 100644
+index 84b83f9..0000000
+--- a/src/main.rs
++++ /dev/null
+@@ -1,90 +0,0 @@
+-use std::{error::Error, time::Duration};
+-
+-use futures_util::{SinkExt, StreamExt};
+-use serde_json::{Value, json};
+-use tokio_tungstenite::{
+-    connect_async,
+-    tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
+-};
+-use uuid::Uuid;
+-
+-const DEFAULT_CSMS_URL: &str = "ws://localhost:9000/CP001";
+-
+-#[tokio::main]
+-async fn main() -> Result<(), Box<dyn Error>> {
+-    let url = std::env::args()
+-        .nth(1)
+-        .unwrap_or_else(|| DEFAULT_CSMS_URL.to_string());
+-
+-    // --- 1. Connect with sub-protocol ocpp1.6 ---
+-    let mut request = url.as_str().into_client_request()?;
+-    request.headers_mut().insert(
+-        "Sec-WebSocket-Protocol",
+-        HeaderValue::from_static("ocpp1.6"),
+-    );
+-    let (ws, _response) = connect_async(request).await?;
+-    println!("Connected to {url}");
+-
+-    // split connection to writing and reading parts
+-    let (mut write, mut read) = ws.split();
+-
+-    // --- 2. BootNotification ---
+-    // CALL: [2, unique ID, action name, payload]
+-    let boot_id = Uuid::new_v4().to_string();
+-    let boot = json!([2, boot_id, "BootNotification", {"chargePointVendor": "Semyon", "chargePointModel": "cp-sim"}]);
+-    write.send(Message::text(boot.to_string())).await?;
+-    println!(">> {boot}");
+-
+-    // Wait for CALLRESULT [3, same ID, payload]. The rest just skipped.
+-    let interval_secs = loop {
+-        let Some(msg) = read.next().await else {
+-            return Err("connection closed before BootNotification response".into());
+-        };
+-        // We're interested in text messages only; skip the rest
+-        let Message::Text(text) = msg? else { continue };
+-        println!("<< {text}");
+-
+-        let frame: Value = serde_json::from_str(text.as_str())?;
+-        if frame[0] == 3 && frame[1] == boot_id.as_str() {
+-            let payload = &frame[2];
+-            if payload["status"] != "Accepted" {
+-                return Err(format!("boot not accepted: {}", payload["status"]).into());
+-            }
+-            // Heartbeat is set by server
+-            break payload["interval"].as_u64().unwrap_or(60);
+-        }
+-    };
+-    println!("accepted, heartbeat every {interval_secs}s");
+-
+-    // --- 3. Heartbeat + intup read simultaneously ---
+-    let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+-    ticker.tick().await; // first tick works immediately — skip it
+-
+-    loop {
+-        // select! waits for both operations, and executes branch of the one, that ended first
+-        tokio::select! {
+-            _ = ticker.tick() => {
+-                let heartbeat = json!([2, Uuid::new_v4().to_string(), "Heartbeat", {}]);
+-                write.send(Message::text(heartbeat.to_string())).await?;
+-                println!(">> {heartbeat}");
+-            }
+-            msg = read.next() => {
+-                match msg {
+-                    Some(Ok(Message::Text(text))) => println!("<< {text}"),
+-                    Some(Ok(Message::Close(frame))) => {
+-                        println!("server closed connection: {frame:?}");
+-                        break;
+-                    }
+-                    Some(Ok(_)) => {} // ping/pong/binary — tungstenite responds to ping self
+-                    Some(Err(e)) => return Err(e.into()),
+-                    None => {
+-                        println!("connection closed");
+-                        break;
+-                    }
+-                }
+-            }
+-        }
+-    }
+-
+-    Ok(())
+-}
