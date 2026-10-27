@@ -47,7 +47,12 @@
       "Bash(ssh *)",
       "Bash(git reset --hard *)",
       "Bash(git clean *)",
-      "Edit(.claude/**)"
+      "Edit(.claude/**)",
+      "Edit(justfile)",
+      "Edit(.githooks/**)",
+      "Edit(**/build.rs)",
+      "Bash(curl *)",
+      "Bash(wget *)"
     ],
     "deny": [
       "Bash(gh pr merge *)",
@@ -56,6 +61,9 @@
       "Bash(git push * -f)",
       "Bash(git push * -f *)",
       "Bash(git commit *--no-verify*)",
+      "Bash(git commit -n*)",
+      "Bash(git commit -an*)",
+      "Bash(git commit * -n*)",
       "Bash(git config *)",
       "Bash(gh auth *)",
       "Bash(gh secret *)",

@@ -27,12 +27,15 @@ stay in the gitignored `.claude/settings.local.json`.
   docs.github.com and code.claude.com.
 - **Ask**: `git push`, `gh pr create`, `cargo add|remove|install`,
   edits to `Cargo.toml` and `csms/pyproject.toml`, `rustup`,
-  `uv tool install`, `uv add`, `just deploy`, `scp`, `ssh`,
-  `git reset --hard`, `git clean`, edits under `.claude/`.
-- **Deny**: `gh pr merge`, force pushes, `git commit --no-verify`,
-  `git config`, `gh auth|secret|repo edit|repo delete|api`, reading
-  `~/.ssh`, `~/.config/gh`, `~/.aws`, `.env*`, `*.pem`, `*.key`, `sudo`,
-  edits in system directories.
+  `uv tool install`, `uv add`, `just deploy`, `scp`, `ssh`, `curl`,
+  `wget`, `git reset --hard`, `git clean`, edits under `.claude/`, and
+  edits to `justfile`, `.githooks/**` and `build.rs` (code that allowed
+  commands and hooks execute).
+- **Deny**: `gh pr merge`, force pushes, `git commit --no-verify` and
+  `-n` (the forms `-n...`, `-an...` and `... -n...`), `git config`,
+  `gh auth|secret|repo edit|repo delete|api`, reading `~/.ssh`,
+  `~/.config/gh`, `~/.aws`, `.env*`, `*.pem`, `*.key`, `sudo`, edits in
+  system directories.
 
 Defence in depth, from the outside in:
 
@@ -55,13 +58,18 @@ Known limitations:
 
 - **Bash rules match command text.** `/usr/bin/scp`, `sh -c '...'`,
   `git -C . push` or `git -c ... push` are not matched by rules written
-  for `scp`, `ssh` or `git push`. Short combined flags (`git push -fu`)
-  and `+refspec` force pushes are not caught by the force-push denies,
-  and `git commit -n` is the short form of `--no-verify`.
+  for `scp`, `ssh`, `curl`, `wget` or `git push`. Short combined flags
+  (`git push -fu`) and `+refspec` force pushes are not caught by the
+  force-push denies.
+- **`git commit -n` is only partly covered.** Clusters that start with
+  `n` or `an`, and a standalone `-n` after other arguments, are denied.
+  Other clusters (`-vn`, `-sn`) are not, and a message that contains
+  ` -n` is denied as a false positive.
 - **Allowed commands run repository code.** `cargo test`/`build` execute
   tests and build scripts, `just test`/`csms` run whatever the
-  `justfile` says. Editing `justfile`, `build.rs` or `.githooks/` is not
-  gated, so an allowed command can be redefined.
+  `justfile` says. Editing `justfile`, `.githooks/` and `build.rs` asks
+  first, but other code they run (for example proc-macro crates, test
+  files or the Python CSMS) is not gated.
 - **Read and edit denies cover Claude's file tools and the Bash file
   commands Claude Code recognises**, not arbitrary processes (a script
   that opens a file itself).
@@ -71,8 +79,10 @@ Known limitations:
   default; the deny list only hardens well-known system directories.
 - **Web fetch from other domains is not an ask rule.** An ask rule for
   all domains would also match the allowed ones (ask is evaluated before
-  allow). Other domains prompt by default instead, and `curl`/`wget`
-  through Bash bypass domain rules entirely.
+  allow). Other domains prompt by default instead. `curl` and `wget`
+  ask, but they bypass the domain rules once approved, and other
+  network tools (`rsync`, `sftp`, `nc`, scripting languages) are not
+  gated.
 - **Allow rules wait for workspace trust.** An allow rule does not match
   past a leading assignment of most environment variables, so a command
   such as `RUSTUP_TOOLCHAIN=stable cargo test` may prompt (not verified

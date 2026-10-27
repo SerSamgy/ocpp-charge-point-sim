@@ -63,11 +63,9 @@ Found during the migration inventory; carried over as is
       `docs/decisions/0005-agent-permission-policy.md`:
   - [ ] evaluate enabling the Claude Code Bash sandbox (filesystem and
         network limits for shell commands);
-  - [ ] ask before editing `justfile`, `.githooks/**` and `build.rs`
-        (allowed commands run them);
-  - [ ] close short-form gaps: `git commit -n`, `git push -fu`,
-        `+refspec` pushes, `git branch -D`, `git switch -f`;
-  - [ ] ask or deny `curl`, `wget`, `rsync`, `sftp`, `uv remove|sync`;
+  - [ ] close short-form gaps: `git push -fu`, `+refspec` pushes,
+        `git branch -D`, `git switch -f`, `git commit -vn`;
+  - [ ] ask or deny `rsync`, `sftp`, `uv remove|sync`;
   - [ ] check how the Code tab of Claude Desktop applies the rules
         (manual checklist in the pull request that added them).
 
