@@ -42,6 +42,8 @@ Run the client against a CSMS: `cargo run -p cp-sim -- ws://localhost:9000/CP001
 
 ## Coding agent permissions
 
+Instructions for the coding agent live in `CLAUDE.md`.
+
 `.claude/settings.json` is the shared project settings file of
 [Claude Code](https://code.claude.com/docs/en/settings). It defines what the
 coding agent may do in this repository: which commands run without asking
