@@ -12,9 +12,17 @@ much as the code.
 The client speaks OCPP 1.6 today; 2.0.1 is planned (see the roadmap).
 Do not hard-wire 1.6 where a second version will plug in.
 
-OCPP specifications live in `docs/specs/` (local, gitignored). Check
-protocol details against them, not memory; if the needed spec is
-missing, say so.
+Check protocol details against the specs, not memory; if the needed
+spec is missing, say so.
+
+- `docs/specs/<version>/` (local, gitignored) holds the spec PDFs, errata
+  sheets and JSON schemas for each OCPP version.
+- Errata take precedence over the main text.
+- JSON schemas are the authority for message fields, types and limits.
+  For OCPP 2.0.1, `appendices-csv/` is the authority for standard device
+  model components and variables.
+- `extra/` holds certification profiles and test cases: consult them
+  only when a task needs them, not in routine searches.
 
 Layout:
 
