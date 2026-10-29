@@ -15,7 +15,7 @@ use tokio_tungstenite::{
 
 use crate::frame::Frame;
 
-// --- Fake CSMS: a one-connection WebSocket server driven by the test ---
+// --- Fake CSMS: a WebSocket server driven by the test ---
 
 #[expect(
     clippy::result_large_err,
@@ -29,68 +29,113 @@ fn echo_ocpp16(_req: &HsRequest, mut resp: Response) -> Result<Response, ErrorRe
     Ok(resp)
 }
 
+/// What the fake server saw, in order.
+#[derive(Debug)]
+pub enum Event {
+    /// A client finished the WebSocket handshake.
+    Connected,
+    /// A text frame from the client.
+    Frame(Frame),
+    /// The current connection is gone (closed by either side or broken).
+    Closed,
+}
+
+enum Command {
+    Send(String),
+    Close,
+}
+
+/// Accepts connections one after another, so a test can watch the client
+/// disconnect and come back.
 pub struct FakeCsms {
     pub url: String,
-    from_client: mpsc::UnboundedReceiver<Frame>,
-    to_client: mpsc::UnboundedSender<String>,
+    events: mpsc::UnboundedReceiver<Event>,
+    commands: mpsc::UnboundedSender<Command>,
 }
 
 impl FakeCsms {
     pub async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/CP001", listener.local_addr().unwrap());
-        let (in_tx, from_client) = mpsc::unbounded_channel();
-        let (to_client, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let (commands, mut command_rx) = mpsc::unbounded_channel();
 
         tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let ws = accept_hdr_async(tcp, echo_ocpp16).await.unwrap();
-            let (mut sink, mut stream) = ws.split();
-            loop {
-                tokio::select! {
-                    msg = stream.next() => match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            let frame: Frame = serde_json::from_str(&text).unwrap();
-                            if in_tx.send(frame).is_err() {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let Ok(ws) = accept_hdr_async(tcp, echo_ocpp16).await else {
+                    continue;
+                };
+                // Send errors only mean the test is gone; the command channel
+                // tells us when to stop.
+                let _ = event_tx.send(Event::Connected);
+                let (mut sink, mut stream) = ws.split();
+                loop {
+                    tokio::select! {
+                        msg = stream.next() => match msg {
+                            Some(Ok(Message::Text(text))) => {
+                                let frame: Frame = serde_json::from_str(&text).unwrap();
+                                let _ = event_tx.send(Event::Frame(frame));
+                            }
+                            Some(Ok(_)) => {}
+                            _ => break,
+                        },
+                        command = command_rx.recv() => match command {
+                            Some(Command::Send(text)) => {
+                                if sink.send(Message::text(text)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Some(Command::Close) => {
+                                let _ = sink.close().await;
                                 break;
                             }
-                        }
-                        Some(Ok(_)) => {}
-                        _ => break,
-                    },
-                    text = out_rx.recv() => match text {
-                        Some(text) => {
-                            if sink.send(Message::text(text)).await.is_err() {
-                                break;
+                            // The test dropped the FakeCsms: close and stop serving.
+                            None => {
+                                let _ = sink.close().await;
+                                return;
                             }
-                        }
-                        // The test dropped the FakeCsms: close the connection.
-                        None => {
-                            let _ = sink.close().await;
-                            break;
-                        }
-                    },
+                        },
+                    }
                 }
+                let _ = event_tx.send(Event::Closed);
             }
         });
 
         FakeCsms {
             url,
-            from_client,
-            to_client,
+            events,
+            commands,
         }
     }
 
-    /// Next frame from the client; panics if nothing arrives within a second.
+    /// Next event; panics if nothing happens within a second.
+    pub async fn recv_event(&mut self) -> Event {
+        timeout(Duration::from_secs(1), self.events.recv())
+            .await
+            .expect("fake CSMS saw nothing")
+            .expect("fake CSMS task is gone")
+    }
+
+    /// Next frame from the client, skipping new connections;
+    /// panics if nothing arrives within a second or the connection closes.
     pub async fn recv(&mut self) -> Frame {
         self.recv_within(Duration::from_secs(1))
             .await
             .expect("client sent nothing")
     }
 
-    /// Next frame from the client, or None if nothing arrives in time.
+    /// Next frame from the client, skipping new connections, or None if
+    /// nothing arrives in time. Panics if the connection closes.
     pub async fn recv_within(&mut self, wait: Duration) -> Option<Frame> {
-        timeout(wait, self.from_client.recv()).await.ok().flatten()
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            match tokio::time::timeout_at(deadline, self.events.recv()).await {
+                Ok(Some(Event::Frame(frame))) => return Some(frame),
+                Ok(Some(Event::Connected)) => continue,
+                Ok(Some(Event::Closed)) => panic!("connection closed while waiting for a frame"),
+                Ok(None) | Err(_) => return None,
+            }
+        }
     }
 
     pub fn send(&self, frame: Frame) {
@@ -98,6 +143,17 @@ impl FakeCsms {
     }
 
     pub fn send_raw(&self, text: &str) {
-        self.to_client.send(text.to_owned()).unwrap();
+        self.command(Command::Send(text.to_owned()));
+    }
+
+    /// Closes the current connection; the server keeps accepting new ones.
+    pub fn close_connection(&self) {
+        self.command(Command::Close);
+    }
+
+    fn command(&self, command: Command) {
+        if self.commands.send(command).is_err() {
+            panic!("fake CSMS task is gone");
+        }
     }
 }

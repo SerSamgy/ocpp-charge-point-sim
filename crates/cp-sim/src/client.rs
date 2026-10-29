@@ -187,7 +187,7 @@ mod tests {
     use super::*;
     use crate::{
         ocpp16::{HeartbeatRequest, HeartbeatResponse},
-        test_support::FakeCsms,
+        test_support::{Event, FakeCsms},
     };
     use tokio::time::timeout;
 
@@ -364,5 +364,22 @@ mod tests {
             .await
             .expect("reader task did not stop")
             .expect("reader task panicked");
+    }
+
+    #[tokio::test]
+    async fn reader_stops_when_server_closes_connection_and_client_can_reconnect() {
+        let mut csms = FakeCsms::start().await;
+        let (_client, reader) = Client::connect(&csms.url, LONG).await.unwrap();
+        assert!(matches!(csms.recv_event().await, Event::Connected));
+
+        csms.close_connection();
+        timeout(Duration::from_secs(1), reader)
+            .await
+            .expect("reader task did not stop")
+            .expect("reader task panicked");
+        assert!(matches!(csms.recv_event().await, Event::Closed));
+
+        let (_client, _reader) = Client::connect(&csms.url, LONG).await.unwrap();
+        assert!(matches!(csms.recv_event().await, Event::Connected));
     }
 }
