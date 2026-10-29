@@ -8,12 +8,15 @@ mod test_support;
 use std::time::Duration;
 
 use crate::{
-    client::Client,
+    client::{Client, Timeouts},
     ocpp16::{BootNotificationRequest, HeartbeatRequest, RegistrationStatus},
 };
 
 const DEFAULT_CSMS_URL: &str = "ws://localhost:9000/CP001";
-const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+const TIMEOUTS: Timeouts = Timeouts {
+    connect: Duration::from_secs(10),
+    call: Duration::from_secs(30),
+};
 
 #[tokio::main]
 async fn main() -> Result<(), client::BoxError> {
@@ -22,7 +25,7 @@ async fn main() -> Result<(), client::BoxError> {
         .unwrap_or_else(|| DEFAULT_CSMS_URL.to_string());
 
     // --- 1. Connect; the reader task is started inside connect() ---
-    let (client, mut reader) = Client::connect(&url, CALL_TIMEOUT).await?;
+    let (client, mut reader) = Client::connect(&url, TIMEOUTS).await?;
     println!("connected to {url}");
 
     // --- 2. BootNotification ---

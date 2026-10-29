@@ -53,6 +53,15 @@ impl fmt::Display for CallFailure {
 
 impl Error for CallFailure {}
 
+/// How long to wait for the network.
+#[derive(Debug, Clone, Copy)]
+pub struct Timeouts {
+    /// TCP connect plus WebSocket handshake.
+    pub connect: Duration,
+    /// From sending a CALL to its CALLRESULT / CALLERROR.
+    pub call: Duration,
+}
+
 pub struct Client {
     /// Write half of the socket. Used by callers and by the reader task
     /// (replies to server CALLs).
@@ -66,23 +75,26 @@ pub struct Client {
 impl Client {
     /// Connects with sub-protocol ocpp1.6 and starts the reader task.
     /// The returned handle finishes when the connection is closed.
+    /// Fails if the server does not complete the handshake within `timeouts.connect`.
     pub async fn connect(
         url: &str,
-        call_timeout: Duration,
+        timeouts: Timeouts,
     ) -> Result<(Arc<Client>, JoinHandle<()>), BoxError> {
         let mut request = url.into_client_request()?;
         request.headers_mut().insert(
             "Sec-WebSocket-Protocol",
             HeaderValue::from_static("ocpp1.6"),
         );
-        let (ws, _response) = connect_async(request).await?;
+        let (ws, _response) = timeout(timeouts.connect, connect_async(request))
+            .await
+            .map_err(|_| format!("no WebSocket handshake within {:?}", timeouts.connect))??;
         let (sink, source) = ws.split();
 
         let client = Arc::new(Client {
             sink: Mutex::new(sink),
             call_lock: Mutex::new(()),
             pending: PendingCalls::default(),
-            call_timeout,
+            call_timeout: timeouts.call,
         });
         let reader = tokio::spawn(read_loop(Arc::clone(&client), source));
         Ok((client, reader))
@@ -189,10 +201,17 @@ mod tests {
         ocpp16::{HeartbeatRequest, HeartbeatResponse},
         test_support::{Event, FakeCsms},
     };
-    use tokio::time::timeout;
+    use tokio::{net::TcpListener, time::timeout};
 
     const LONG: Duration = Duration::from_secs(5);
     const SHORT: Duration = Duration::from_millis(300);
+
+    fn timeouts(call: Duration) -> Timeouts {
+        Timeouts {
+            connect: LONG,
+            call,
+        }
+    }
 
     // --- Helpers ---
 
@@ -214,7 +233,7 @@ mod tests {
     #[tokio::test]
     async fn call_returns_typed_response() {
         let mut csms = FakeCsms::start().await;
-        let (client, _reader) = Client::connect(&csms.url, LONG).await.unwrap();
+        let (client, _reader) = Client::connect(&csms.url, timeouts(LONG)).await.unwrap();
 
         let call = spawn_heartbeat(&client);
         let Frame::Call {
@@ -236,7 +255,7 @@ mod tests {
     #[tokio::test]
     async fn call_error_is_reported_as_rejected() {
         let mut csms = FakeCsms::start().await;
-        let (client, _reader) = Client::connect(&csms.url, LONG).await.unwrap();
+        let (client, _reader) = Client::connect(&csms.url, timeouts(LONG)).await.unwrap();
 
         let call = spawn_heartbeat(&client);
         let id = csms.recv().await.id().to_owned();
@@ -257,7 +276,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_response_payload_is_reported() {
         let mut csms = FakeCsms::start().await;
-        let (client, _reader) = Client::connect(&csms.url, LONG).await.unwrap();
+        let (client, _reader) = Client::connect(&csms.url, timeouts(LONG)).await.unwrap();
 
         let call = spawn_heartbeat(&client);
         let id = csms.recv().await.id().to_owned();
@@ -273,7 +292,7 @@ mod tests {
     #[tokio::test]
     async fn call_times_out_and_late_response_is_ignored() {
         let mut csms = FakeCsms::start().await;
-        let (client, _reader) = Client::connect(&csms.url, SHORT).await.unwrap();
+        let (client, _reader) = Client::connect(&csms.url, timeouts(SHORT)).await.unwrap();
 
         let first = spawn_heartbeat(&client);
         let first_id = csms.recv().await.id().to_owned();
@@ -297,7 +316,7 @@ mod tests {
     #[tokio::test]
     async fn ignores_malformed_and_unrelated_frames() {
         let mut csms = FakeCsms::start().await;
-        let (client, _reader) = Client::connect(&csms.url, LONG).await.unwrap();
+        let (client, _reader) = Client::connect(&csms.url, timeouts(LONG)).await.unwrap();
 
         let call = spawn_heartbeat(&client);
         let id = csms.recv().await.id().to_owned();
@@ -312,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn answers_server_call_with_not_implemented() {
         let mut csms = FakeCsms::start().await;
-        let (_client, _reader) = Client::connect(&csms.url, LONG).await.unwrap();
+        let (_client, _reader) = Client::connect(&csms.url, timeouts(LONG)).await.unwrap();
 
         csms.send(Frame::Call {
             id: "srv-1".into(),
@@ -335,7 +354,7 @@ mod tests {
     #[tokio::test]
     async fn only_one_call_in_flight() {
         let mut csms = FakeCsms::start().await;
-        let (client, _reader) = Client::connect(&csms.url, LONG).await.unwrap();
+        let (client, _reader) = Client::connect(&csms.url, timeouts(LONG)).await.unwrap();
 
         let a = spawn_heartbeat(&client);
         let b = spawn_heartbeat(&client);
@@ -357,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn reader_stops_when_server_closes() {
         let csms = FakeCsms::start().await;
-        let (_client, reader) = Client::connect(&csms.url, LONG).await.unwrap();
+        let (_client, reader) = Client::connect(&csms.url, timeouts(LONG)).await.unwrap();
 
         drop(csms); // the fake server closes the connection
         timeout(Duration::from_secs(1), reader)
@@ -369,7 +388,7 @@ mod tests {
     #[tokio::test]
     async fn reader_stops_when_server_closes_connection_and_client_can_reconnect() {
         let mut csms = FakeCsms::start().await;
-        let (_client, reader) = Client::connect(&csms.url, LONG).await.unwrap();
+        let (_client, reader) = Client::connect(&csms.url, timeouts(LONG)).await.unwrap();
         assert!(matches!(csms.recv_event().await, Event::Connected));
 
         csms.close_connection();
@@ -379,7 +398,31 @@ mod tests {
             .expect("reader task panicked");
         assert!(matches!(csms.recv_event().await, Event::Closed));
 
-        let (_client, _reader) = Client::connect(&csms.url, LONG).await.unwrap();
+        let (_client, _reader) = Client::connect(&csms.url, timeouts(LONG)).await.unwrap();
         assert!(matches!(csms.recv_event().await, Event::Connected));
+    }
+
+    #[tokio::test]
+    async fn connect_times_out_without_handshake() {
+        // Accepts TCP but never answers the WebSocket handshake.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/CP001", listener.local_addr().unwrap());
+        let _silent = tokio::spawn(async move {
+            let (_tcp, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let started = tokio::time::Instant::now();
+        let result = Client::connect(
+            &url,
+            Timeouts {
+                connect: SHORT,
+                call: LONG,
+            },
+        )
+        .await;
+
+        assert!(result.is_err(), "connected to a silent server");
+        assert!(started.elapsed() < LONG, "connect ignored its timeout");
     }
 }
