@@ -17,6 +17,8 @@ mod test_support;
 
 use std::time::Duration;
 
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
 use crate::{
     client::Timeouts,
     ocpp16::{BootNotificationRequest, HeartbeatRequest},
@@ -34,6 +36,12 @@ async fn main() -> Result<(), client::BoxError> {
     let url = std::env::args()
         .nth(1)
         .unwrap_or_else(|| DEFAULT_CSMS_URL.to_string());
+
+    // A malformed URL does not get better by retrying: fail at once.
+    let handshake = url.as_str().into_client_request()?;
+    if !matches!(handshake.uri().scheme_str(), Some("ws" | "wss")) {
+        return Err(format!("not a WebSocket URL: {url}").into());
+    }
 
     // --- 1. Connect and boot until the server accepts us ---
     let Registered {
