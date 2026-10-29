@@ -1,3 +1,11 @@
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the reconnect loop starts using it in the next commit"
+    )
+)]
+mod backoff;
 mod boot;
 mod client;
 mod frame;
