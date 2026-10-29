@@ -1,3 +1,4 @@
+mod boot;
 mod client;
 mod frame;
 mod ocpp16;
@@ -8,8 +9,9 @@ mod test_support;
 use std::time::Duration;
 
 use crate::{
+    boot::BootStep,
     client::{Client, Timeouts},
-    ocpp16::{BootNotificationRequest, HeartbeatRequest, RegistrationStatus},
+    ocpp16::{BootNotificationRequest, HeartbeatRequest},
 };
 
 const DEFAULT_CSMS_URL: &str = "ws://localhost:9000/CP001";
@@ -37,13 +39,17 @@ async fn main() -> Result<(), client::BoxError> {
             firmware_version: None,
         })
         .await?;
-    if boot.status != RegistrationStatus::Accepted {
-        return Err(format!("boot not accepted: {:?}", boot.status).into());
-    }
-    println!("accepted, heartbeat every {}s", boot.interval);
+    let heartbeat = match boot::next_step(&boot) {
+        BootStep::Accepted { heartbeat } => heartbeat,
+        BootStep::RetryOnSameConnection { after } | BootStep::Reconnect { after } => {
+            return Err(format!("boot not accepted: {:?}, retry in {after:?}", boot.status).into());
+        }
+    };
+    println!("accepted, heartbeat every {heartbeat:?}");
 
     // --- 3. Heartbeat until the connection closes ---
-    let mut ticker = tokio::time::interval(Duration::from_secs(boot.interval));
+    // `heartbeat` is never zero: next_step replaces 0 with a default.
+    let mut ticker = tokio::time::interval(heartbeat);
     ticker.tick().await; // first tick completes immediately — skip it
 
     loop {
