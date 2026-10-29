@@ -2,6 +2,8 @@ mod client;
 mod frame;
 mod ocpp16;
 mod pending;
+#[cfg(test)]
+mod test_support;
 
 use std::time::Duration;
 
