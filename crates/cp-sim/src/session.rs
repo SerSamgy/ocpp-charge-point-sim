@@ -37,32 +37,53 @@ pub async fn register(
     loop {
         let (client, mut reader) = Client::connect(url, timeouts).await?;
         println!("connected to {url}");
-        loop {
-            let response = client.call(request).await?;
-            match boot::next_step(&response) {
-                BootStep::Accepted { heartbeat } => {
-                    return Ok(Registered {
-                        client,
-                        reader,
-                        heartbeat,
-                    });
-                }
-                BootStep::RetryOnSameConnection { after } => {
-                    println!("boot pending, next attempt in {after:?}");
-                    tokio::select! {
-                        _ = sleep(after) => {}
-                        _ = &mut reader => {
-                            return Err("connection closed while the boot was pending".into());
-                        }
+        match boot(&client, &mut reader, request).await? {
+            Booted::Accepted { heartbeat } => {
+                return Ok(Registered {
+                    client,
+                    reader,
+                    heartbeat,
+                });
+            }
+            Booted::Rejected { after } => {
+                println!("boot rejected, reconnecting in {after:?}");
+                disconnect(&client, reader, timeouts.call).await;
+                sleep(after).await;
+            }
+        }
+    }
+}
+
+/// How a boot on one connection ended.
+enum Booted {
+    /// Registered: send Heartbeat every `heartbeat`.
+    Accepted { heartbeat: Duration },
+    /// Rejected: close the connection and stay away for `after`.
+    Rejected { after: Duration },
+}
+
+/// Sends BootNotification on an open connection until the server accepts or
+/// rejects it. Pending: wait on the same connection, then boot again; fails at
+/// once if the connection drops meanwhile.
+async fn boot(
+    client: &Client,
+    reader: &mut JoinHandle<()>,
+    request: &BootNotificationRequest,
+) -> Result<Booted, BoxError> {
+    loop {
+        let response = client.call(request).await?;
+        match boot::next_step(&response) {
+            BootStep::Accepted { heartbeat } => return Ok(Booted::Accepted { heartbeat }),
+            BootStep::RetryOnSameConnection { after } => {
+                println!("boot pending, next attempt in {after:?}");
+                tokio::select! {
+                    _ = sleep(after) => {}
+                    _ = &mut *reader => {
+                        return Err("connection closed while the boot was pending".into());
                     }
                 }
-                BootStep::Reconnect { after } => {
-                    println!("boot rejected, reconnecting in {after:?}");
-                    disconnect(&client, reader, timeouts.call).await;
-                    sleep(after).await;
-                    break;
-                }
             }
+            BootStep::Reconnect { after } => return Ok(Booted::Rejected { after }),
         }
     }
 }
