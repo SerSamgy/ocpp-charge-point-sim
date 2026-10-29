@@ -1,17 +1,25 @@
+mod boot;
 mod client;
 mod frame;
 mod ocpp16;
 mod pending;
+mod session;
+#[cfg(test)]
+mod test_support;
 
 use std::time::Duration;
 
 use crate::{
-    client::Client,
-    ocpp16::{BootNotificationRequest, HeartbeatRequest, RegistrationStatus},
+    client::Timeouts,
+    ocpp16::{BootNotificationRequest, HeartbeatRequest},
+    session::Registered,
 };
 
 const DEFAULT_CSMS_URL: &str = "ws://localhost:9000/CP001";
-const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+const TIMEOUTS: Timeouts = Timeouts {
+    connect: Duration::from_secs(10),
+    call: Duration::from_secs(30),
+};
 
 #[tokio::main]
 async fn main() -> Result<(), client::BoxError> {
@@ -19,26 +27,27 @@ async fn main() -> Result<(), client::BoxError> {
         .nth(1)
         .unwrap_or_else(|| DEFAULT_CSMS_URL.to_string());
 
-    // --- 1. Connect; the reader task is started inside connect() ---
-    let (client, mut reader) = Client::connect(&url, CALL_TIMEOUT).await?;
-    println!("connected to {url}");
-
-    // --- 2. BootNotification ---
-    let boot = client
-        .call(&BootNotificationRequest {
+    // --- 1. Connect and boot until the server accepts us ---
+    let Registered {
+        client,
+        mut reader,
+        heartbeat,
+    } = session::register(
+        &url,
+        TIMEOUTS,
+        &BootNotificationRequest {
             charge_point_vendor: "Semyon".into(),
             charge_point_model: "cp-sim".into(),
             charge_point_serial_number: None,
             firmware_version: None,
-        })
-        .await?;
-    if boot.status != RegistrationStatus::Accepted {
-        return Err(format!("boot not accepted: {:?}", boot.status).into());
-    }
-    println!("accepted, heartbeat every {}s", boot.interval);
+        },
+    )
+    .await?;
+    println!("accepted, heartbeat every {heartbeat:?}");
 
-    // --- 3. Heartbeat until the connection closes ---
-    let mut ticker = tokio::time::interval(Duration::from_secs(boot.interval));
+    // --- 2. Heartbeat until the connection closes ---
+    // `heartbeat` is never zero: boot::next_step replaces 0 with a default.
+    let mut ticker = tokio::time::interval(heartbeat);
     ticker.tick().await; // first tick completes immediately — skip it
 
     loop {

@@ -9,7 +9,14 @@ use crate::frame::Frame;
 
 #[derive(Default)]
 pub struct PendingCalls {
-    inner: Mutex<HashMap<String, oneshot::Sender<Frame>>>,
+    inner: Mutex<Inner>,
+}
+
+#[derive(Default)]
+struct Inner {
+    waiting: HashMap<String, oneshot::Sender<Frame>>,
+    /// Set once the connection is gone: no answer can arrive any more.
+    closed: bool,
 }
 
 impl PendingCalls {
@@ -17,7 +24,12 @@ impl PendingCalls {
     /// The returned receiver resolves with the response frame.
     pub fn register(&self, id: String) -> oneshot::Receiver<Frame> {
         let (tx, rx) = oneshot::channel();
-        if self.inner.lock().unwrap().insert(id.clone(), tx).is_some() {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            // Dropping `tx` makes the receiver fail at once.
+            return rx;
+        }
+        if inner.waiting.insert(id.clone(), tx).is_some() {
             eprintln!("duplicate pending CALL id={id}; previous waiter dropped")
         }
         rx
@@ -31,7 +43,7 @@ impl PendingCalls {
             return Err(frame);
         }
 
-        let Some(tx) = self.inner.lock().unwrap().remove(frame.id()) else {
+        let Some(tx) = self.inner.lock().unwrap().waiting.remove(frame.id()) else {
             return Err(frame);
         };
         tx.send(frame)
@@ -39,7 +51,15 @@ impl PendingCalls {
 
     /// Forgets a CALL that will never be answered (timeout, send failure).
     pub fn cancel(&self, id: &str) {
-        self.inner.lock().unwrap().remove(id);
+        self.inner.lock().unwrap().waiting.remove(id);
+    }
+
+    /// The connection is gone: fails every waiting CALL and every later one.
+    pub fn close(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.closed = true;
+        // Dropping the senders wakes their receivers with an error.
+        inner.waiting.clear();
     }
 }
 
@@ -143,5 +163,17 @@ mod tests {
         assert!(first.await.is_err());
         assert!(pending.complete(result("1")).is_ok());
         assert_eq!(second.await.unwrap(), result("1"));
+    }
+
+    #[tokio::test]
+    async fn close_fails_waiting_and_later_calls() {
+        let pending = PendingCalls::default();
+        let waiting = pending.register("1".into());
+        pending.close();
+        let later = pending.register("2".into());
+
+        assert!(waiting.await.is_err());
+        assert!(later.await.is_err());
+        assert_eq!(pending.complete(result("1")), Err(result("1")));
     }
 }

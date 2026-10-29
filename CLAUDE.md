@@ -63,7 +63,9 @@ Layout:
 - Push and PR creation need the owner's confirmation. Never merge, never
   force-push, never rewrite pushed history: the owner merges with merge
   commits and the journal references commit hashes.
-- PR body in English: summary, why, how to verify.
+- PR body in English: summary, why, how to verify. No hard line wraps:
+  GitHub renders every newline as a line break, so each paragraph and
+  list item goes on one line. Commit message bodies stay wrapped at 72.
 - After opening a PR, wait for CI with `gh pr checks` and fix failures
   with new commits.
 - Update `docs/roadmap.md` when a task changes its status. Write an ADR in

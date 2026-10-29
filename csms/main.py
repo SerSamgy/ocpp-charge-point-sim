@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+from collections import defaultdict
 from datetime import UTC, datetime
 
 import websockets
@@ -11,7 +13,20 @@ from ocpp.v16.enums import Action, RegistrationStatus
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 9000
 OCPP_PROTOCOL = "ocpp1.6"
-HEARTBEAT_INTERVAL = 10
+
+# Boot responses are configurable for testing the client's retry logic:
+#   BOOT_STATUSES=Pending,Rejected,Accepted  one status per BootNotification of a
+#                                            charge point; the last one repeats
+#   BOOT_INTERVAL=3                          the "interval" field, in seconds
+BOOT_STATUSES = [
+    RegistrationStatus(status.strip())
+    for status in os.environ.get("BOOT_STATUSES", "Accepted").split(",")
+]
+BOOT_INTERVAL = int(os.environ.get("BOOT_INTERVAL", "10"))
+
+# BootNotifications received per charge point ID. Kept across connections,
+# because a rejected charge point reconnects before booting again.
+boot_counts: defaultdict[str, int] = defaultdict(int)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -30,10 +45,14 @@ class ChargePoint(cp):
         logger.info(
             f"BootNotification from {self.id}: vendor={charge_point_vendor} model={charge_point_model}"
         )
+        count = boot_counts[self.id]
+        boot_counts[self.id] += 1
+        status = BOOT_STATUSES[min(count, len(BOOT_STATUSES) - 1)]
+        logger.info(f"Answering {status} with interval {BOOT_INTERVAL}")
         return call_result.BootNotification(
             current_time=now_iso(),
-            interval=HEARTBEAT_INTERVAL,
-            status=RegistrationStatus.accepted,
+            interval=BOOT_INTERVAL,
+            status=status,
         )
 
     @on(Action.heartbeat)
