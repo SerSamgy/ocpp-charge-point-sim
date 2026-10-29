@@ -110,7 +110,12 @@ impl FakeCsms {
 
     /// Next event; panics if nothing happens within a second.
     pub async fn recv_event(&mut self) -> Event {
-        timeout(Duration::from_secs(1), self.events.recv())
+        self.recv_event_within(Duration::from_secs(1)).await
+    }
+
+    /// Next event; panics if nothing happens within `wait`.
+    pub async fn recv_event_within(&mut self, wait: Duration) -> Event {
+        timeout(wait, self.events.recv())
             .await
             .expect("fake CSMS saw nothing")
             .expect("fake CSMS task is gone")

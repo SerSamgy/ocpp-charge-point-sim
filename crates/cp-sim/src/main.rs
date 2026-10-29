@@ -3,15 +3,16 @@ mod client;
 mod frame;
 mod ocpp16;
 mod pending;
+mod session;
 #[cfg(test)]
 mod test_support;
 
 use std::time::Duration;
 
 use crate::{
-    boot::BootStep,
-    client::{Client, Timeouts},
+    client::Timeouts,
     ocpp16::{BootNotificationRequest, HeartbeatRequest},
+    session::Registered,
 };
 
 const DEFAULT_CSMS_URL: &str = "ws://localhost:9000/CP001";
@@ -26,29 +27,26 @@ async fn main() -> Result<(), client::BoxError> {
         .nth(1)
         .unwrap_or_else(|| DEFAULT_CSMS_URL.to_string());
 
-    // --- 1. Connect; the reader task is started inside connect() ---
-    let (client, mut reader) = Client::connect(&url, TIMEOUTS).await?;
-    println!("connected to {url}");
-
-    // --- 2. BootNotification ---
-    let boot = client
-        .call(&BootNotificationRequest {
+    // --- 1. Connect and boot until the server accepts us ---
+    let Registered {
+        client,
+        mut reader,
+        heartbeat,
+    } = session::register(
+        &url,
+        TIMEOUTS,
+        &BootNotificationRequest {
             charge_point_vendor: "Semyon".into(),
             charge_point_model: "cp-sim".into(),
             charge_point_serial_number: None,
             firmware_version: None,
-        })
-        .await?;
-    let heartbeat = match boot::next_step(&boot) {
-        BootStep::Accepted { heartbeat } => heartbeat,
-        BootStep::RetryOnSameConnection { after } | BootStep::Reconnect { after } => {
-            return Err(format!("boot not accepted: {:?}, retry in {after:?}", boot.status).into());
-        }
-    };
+        },
+    )
+    .await?;
     println!("accepted, heartbeat every {heartbeat:?}");
 
-    // --- 3. Heartbeat until the connection closes ---
-    // `heartbeat` is never zero: next_step replaces 0 with a default.
+    // --- 2. Heartbeat until the connection closes ---
+    // `heartbeat` is never zero: boot::next_step replaces 0 with a default.
     let mut ticker = tokio::time::interval(heartbeat);
     ticker.tick().await; // first tick completes immediately — skip it
 

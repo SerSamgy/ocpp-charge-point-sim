@@ -137,6 +137,15 @@ impl Client {
         }
     }
 
+    /// Starts the closing handshake: sends a Close frame. The reader task
+    /// finishes when the server answers with its own Close. We are done with
+    /// this connection, so waiting and later CALLs fail with `Disconnected`
+    /// right away.
+    pub async fn close(&self) -> Result<(), tungstenite::Error> {
+        self.pending.close();
+        self.sink.lock().await.close().await
+    }
+
     /// Serializes a frame, logs it as `>> ...` and writes it to the socket.
     async fn send_frame(&self, frame: &Frame) -> Result<(), tungstenite::Error> {
         let text = serde_json::to_string(frame).expect("Frame always serializes");
@@ -453,5 +462,27 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(matches!(err, CallFailure::Disconnected), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn close_ends_the_connection_and_fails_calls() {
+        let mut csms = FakeCsms::start().await;
+        let (client, reader) = Client::connect(&csms.url, timeouts(LONG)).await.unwrap();
+        let waiting = spawn_heartbeat(&client);
+        csms.recv().await;
+
+        client.close().await.unwrap();
+
+        let err = timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("waiting call hung after close")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(err, CallFailure::Disconnected), "got {err:?}");
+        assert!(matches!(csms.recv_event().await, Event::Closed));
+        timeout(Duration::from_secs(1), reader)
+            .await
+            .expect("reader task did not stop")
+            .expect("reader task panicked");
     }
 }
