@@ -150,7 +150,8 @@ impl Client {
 /// - responses go to `pending`
 /// - server CALLs get a CALLERROR NotImplemented with empty details
 /// - malformed or unexpected frames are logged and skipped
-/// - Close, end of stream or a transport error end the loop
+/// - Close, end of stream or a transport error end the loop;
+///   then every waiting and later CALL fails with `Disconnected`
 async fn read_loop(client: Arc<Client>, mut source: WsSource) {
     while let Some(msg) = source.next().await {
         match msg {
@@ -191,6 +192,9 @@ async fn read_loop(client: Arc<Client>, mut source: WsSource) {
             }
         }
     }
+    // Nobody will answer the CALLs still waiting: let them fail now
+    // instead of running into their timeout.
+    client.pending.close();
     println!("connection closed")
 }
 
@@ -424,5 +428,30 @@ mod tests {
 
         assert!(result.is_err(), "connected to a silent server");
         assert!(started.elapsed() < LONG, "connect ignored its timeout");
+    }
+
+    #[tokio::test]
+    async fn calls_fail_at_once_when_connection_closes() {
+        let mut csms = FakeCsms::start().await;
+        let (client, reader) = Client::connect(&csms.url, timeouts(LONG)).await.unwrap();
+
+        let waiting = spawn_heartbeat(&client);
+        csms.recv().await;
+        csms.close_connection();
+
+        let err = timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("waiting call hung after the connection closed")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(err, CallFailure::Disconnected), "got {err:?}");
+
+        reader.await.unwrap();
+        let err = timeout(Duration::from_secs(1), spawn_heartbeat(&client))
+            .await
+            .expect("call on a closed client hung")
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(err, CallFailure::Disconnected), "got {err:?}");
     }
 }
