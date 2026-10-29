@@ -15,9 +15,11 @@ both tracks. Status: **done**, **in progress** or **not started**.
    - [x] response matching by message ID
    - [x] replies to server-initiated CALLs (CALLERROR `NotImplemented`)
    - [x] cargo workspace (done by the migration)
-   - [ ] **3e.** Retry BootNotification on `Rejected` / `Pending`,
-         reconnect with backoff, connection timeout, guard against
-         `interval = 0`.
+   - [x] **3e.** Retry BootNotification on `Rejected` / `Pending`,
+         connection timeout, guard against `interval = 0`.
+   - [ ] **3e2.** Reconnect with backoff after a lost connection
+         (OCPP 2.0.1 part 4 §5.4 algorithm, `rand` for jitter); a failing
+         Heartbeat or BootNotification CALL does not exit the program.
    - [ ] **3f.** Graceful shutdown on Ctrl+C.
 4. **Not started.** Connector state machine: Available → Preparing →
    Charging → Finishing → Available, plus Faulted. StatusNotification on
@@ -38,7 +40,7 @@ both tracks. Status: **done**, **in progress** or **not started**.
 
 ## Suggested order
 
-3e → 3f → 4 → 8 → 5 → 10; 9 at any time.
+3e2 → 3f → 4 → 8 → 5 → 10; 9 at any time.
 
 ## Larger blocks after that
 
@@ -63,11 +65,12 @@ both tracks. Status: **done**, **in progress** or **not started**.
 Found during the migration inventory; carried over as is
 (see `docs/decisions/0002-as-is-migration.md`).
 
-- [ ] Handle `interval = 0` from the server (`tokio::time::interval`
-      panics today). Part of step 3e.
-- [ ] Retry BootNotification after `interval` on `Pending` / `Rejected`
-      instead of exiting. Part of step 3e.
+- [x] Handle `interval = 0` from the server (`tokio::time::interval`
+      panics today). Done in step 3e.
+- [x] Retry BootNotification after `interval` on `Pending` / `Rejected`
+      instead of exiting. Done in step 3e.
 - [ ] A failing Heartbeat (timeout, CALLERROR) should not exit the program.
+      Part of step 3e2.
 - [ ] Extract an `ocpp-proto` library crate (see `docs/archive/`).
 - [ ] Turn `cp-blink` into a hardware library (pin table, `Button`,
       debounce) with the experiments as examples.
