@@ -79,6 +79,13 @@ Found during the migration inventory; carried over as is
 - [ ] Structured logging with `tracing` instead of `println!`.
 - [ ] Fix the test name typo `cpms` in `boot_response_parses_cpms_response`.
 - [ ] `csms`: write the README and the `pyproject.toml` description.
+- [ ] Configurable port for end-to-end checks: `csms/main.py` hard-codes
+      port 9000 (`SERVER_PORT`), so a check fails whenever the port is
+      taken, e.g. by a CSMS left running. Make the CSMS port configurable
+      (environment variable or argument, also through `just csms`), and
+      let the client read its URL the same way. Today the client takes
+      the URL only as the first command-line argument, with
+      `ws://localhost:9000/CP001` as the default.
 - [ ] Let crates inherit `edition` from `[workspace.package]`.
 - [ ] Agent permissions, follow-ups to
       `docs/decisions/0005-agent-permission-policy.md`:
