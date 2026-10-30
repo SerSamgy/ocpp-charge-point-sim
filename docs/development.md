@@ -54,7 +54,7 @@ request. Rules and reasons: `docs/decisions/0004-commit-message-hook.md`.
 
 | Job | Checks | Local |
 |---|---|---|
-| `rust` | `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo check` for `aarch64-unknown-linux-musl` | `just ci-rust` |
+| `rust` | `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo check` for `aarch64-unknown-linux-musl`, `just check-docs` (every test named in the invariants table of `docs/architecture.md` exists) | `just ci-rust` |
 | `python` | `ruff check` and `ruff format --check` in `csms/` | `just ci-python` |
 | `commits` | every non-merge commit of the PR passes `.githooks/commit-msg` | the hook itself |
 

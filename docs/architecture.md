@@ -54,6 +54,9 @@ how `session` learns that the connection is gone.
 ## Invariants
 
 Each one is enforced by the tests named here (`module::tests::name`).
+`just check-docs`, part of `just ci`, fails when a named test no longer
+exists, so a test that is renamed or moved must be updated here too. It
+does not check that a test still means what the row says; review does.
 
 | Invariant | Tests |
 |---|---|
