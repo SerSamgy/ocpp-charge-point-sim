@@ -25,3 +25,6 @@ hook was the first commit, so every commit in the history passed it.
   `--no-verify`; a CI check is needed to enforce it for contributions
   (listed in the roadmap).
 - No Node.js or Python tooling (commitlint, pre-commit) is required.
+
+> Update: commit messages are now also checked in CI by the `commits`
+> job, see `docs/decisions/0006-ci-on-github-actions.md`.

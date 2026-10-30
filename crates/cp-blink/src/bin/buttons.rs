@@ -1,3 +1,5 @@
+//! Reads the four buttons by polling every 1 ms with a software debouncer.
+
 use rppal::gpio::{Gpio, InputPin, Level};
 use std::thread;
 use std::time::{Duration, Instant};
