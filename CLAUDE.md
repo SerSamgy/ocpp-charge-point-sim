@@ -31,6 +31,10 @@ Layout:
 - `csms/`: Python test CSMS (`uv`, `ruff`).
 - `justfile`: all build, check and deploy commands (`just --list`).
 - `docs/roadmap.md`: steps, statuses, backlog. Start every task here.
+- `docs/architecture.md`: map of the code: modules, message flow,
+  invariants with their tests, OCPP 2.0.1 extension points.
+- `docs/development.md`: tools, cross-build, CI, agent settings, and
+  GitHub settings configured outside the repository.
 - `docs/decisions/`: ADRs (architecture decision records). Read the
   relevant ones before changing what they cover.
 - `docs/hardware/`: pin table and wiring notes.
@@ -70,6 +74,10 @@ Layout:
   with new commits.
 - Update `docs/roadmap.md` when a task changes its status. Write an ADR in
   `docs/decisions/` for decisions that are hard to reverse.
+- A PR that changes the code structure (crates, modules, message flow,
+  invariants) updates `docs/architecture.md`. A PR that changes tooling,
+  CI, agent settings or configuration outside the repository updates
+  `docs/development.md`.
 
 ## Learning journal
 
