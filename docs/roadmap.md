@@ -118,6 +118,10 @@ Found during the migration inventory; carried over as is
       let the client read its URL the same way. Today the client takes
       the URL only as the first command-line argument, with
       `ws://localhost:9000/CP001` as the default.
+- [ ] Fix the six rustdoc warnings in `crates/cp-sim/src/frame.rs`
+      (`<id>` and the like in doc comments read as unclosed HTML tags),
+      then consider `cargo doc` with `RUSTDOCFLAGS=-D warnings` in
+      `just ci`.
 - [ ] Let crates inherit `edition` from `[workspace.package]`.
 - [ ] Agent permissions, follow-ups to
       `docs/decisions/0005-agent-permission-policy.md`:
