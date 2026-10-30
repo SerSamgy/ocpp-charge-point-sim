@@ -1,3 +1,5 @@
+//! Reads the four buttons with GPIO interrupts and the debounce of `rppal`.
+
 use rppal::gpio::{Gpio, Trigger};
 use std::sync::mpsc;
 use std::time::Duration;

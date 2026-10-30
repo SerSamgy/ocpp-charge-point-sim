@@ -1,3 +1,10 @@
+//! OCPP charge point simulator: connects to a CSMS over WebSocket, boots
+//! and keeps the connection alive. Speaks OCPP 1.6 today.
+//!
+//! Usage: `cp-sim [ws://host:port/<charge_point_id>]`, default
+//! `ws://localhost:9000/CP001`. The map of the modules and their
+//! invariants is `docs/architecture.md`.
+
 mod backoff;
 mod boot;
 mod client;

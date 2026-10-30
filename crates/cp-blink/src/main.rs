@@ -1,3 +1,7 @@
+//! GPIO experiments on the Raspberry Pi 5. This binary blinks the LED on
+//! GPIO17; the binaries in `src/bin/` read the buttons. Pins:
+//! `docs/hardware/README.md`.
+
 use rppal::gpio::Gpio;
 use std::{error::Error, thread, time::Duration};
 

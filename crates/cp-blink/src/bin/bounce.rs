@@ -1,3 +1,5 @@
+//! Records the raw edges of one button press to make contact bounce visible.
+
 use std::time::{Duration, Instant};
 
 use rppal::gpio::{Gpio, Level};
