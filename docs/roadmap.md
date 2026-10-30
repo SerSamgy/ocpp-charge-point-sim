@@ -81,6 +81,13 @@ Found during the migration inventory; carried over as is
 - [ ] Make the reconnect back-off settings (`RetryBackOffWaitMinimum`,
       `RetryBackOffRandomRange`, `RetryBackOffRepeatTimes`) configurable;
       today they are constants in `crates/cp-sim/src/main.rs`.
+- [ ] Test that the client offers sub-protocol `ocpp1.6` in the
+      WebSocket handshake: the fake CSMS in `test_support` answers
+      `ocpp1.6` without checking the request (`docs/architecture.md`,
+      invariants).
+- [ ] Test the startup check that rejects a malformed or non-`ws(s)://`
+      CSMS URL: it lives in `main`, so move it into a testable function
+      first.
 - [ ] Extract an `ocpp-proto` library crate (see `docs/archive/`).
 - [ ] Turn `cp-blink` into a hardware library (pin table, `Button`,
       debounce) with the experiments as examples.
