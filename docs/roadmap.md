@@ -4,22 +4,34 @@ Two tracks move in parallel: the OCPP protocol client and the hardware
 and system side of the simulated charge point. Steps are numbered across
 both tracks. Status: **done**, **in progress** or **not started**.
 
+Each done item links to the pull request that finished it. Work done
+before the repository existed came in with the migration
+(`docs/decisions/0001-fresh-history.md`) and names its import commit
+instead.
+
 ## Protocol track
 
-1. **Done.** Python test CSMS (`csms/`), OCPP 1.6.
+1. **Done.** Python test CSMS (`csms/`), OCPP 1.6. Imported in
+   `565ace1`.
 2. **Done.** BootNotification and Heartbeat in the Rust client
-   (`crates/cp-sim`); runs on the laptop and on the Pi.
+   (`crates/cp-sim`); runs on the laptop and on the Pi. Imported in
+   `2e2ecf2`.
 3. **In progress.** Protocol core.
-   - [x] OCPP-J `Frame` (CALL, CALLRESULT, CALLERROR)
-   - [x] typed messages (`Request` trait with action and response type)
-   - [x] response matching by message ID
-   - [x] replies to server-initiated CALLs (CALLERROR `NotImplemented`)
-   - [x] cargo workspace (done by the migration)
+   - [x] OCPP-J `Frame` (CALL, CALLRESULT, CALLERROR). Imported in
+         `2e2ecf2`.
+   - [x] typed messages (`Request` trait with action and response type).
+         Imported in `2e2ecf2`.
+   - [x] response matching by message ID. Imported in `2e2ecf2`.
+   - [x] replies to server-initiated CALLs (CALLERROR `NotImplemented`).
+         Imported in `2e2ecf2`.
+   - [x] cargo workspace (done by the migration). Imported in `2e2ecf2`.
    - [x] **3e.** Retry BootNotification on `Rejected` / `Pending`,
          connection timeout, guard against `interval = 0`.
+         [#5](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/5)
    - [x] **3e2.** Reconnect with backoff after a lost connection
          (OCPP 2.0.1 part 4 §5.4 algorithm, `rand` for jitter); a failing
          Heartbeat or BootNotification CALL does not exit the program.
+         [#6](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/6)
    - [ ] **3f.** Graceful shutdown on Ctrl+C.
 4. **Not started.** Connector state machine: Available → Preparing →
    Charging → Finishing → Available, plus Faulted. StatusNotification on
@@ -29,9 +41,9 @@ both tracks. Status: **done**, **in progress** or **not started**.
 
 ## Hardware and system track
 
-6. **Done.** LED on GPIO via `rppal`.
+6. **Done.** LED on GPIO via `rppal`. Imported in `f922c90`.
 7. **Done.** Four buttons, debouncing, polling vs interrupts. See
-   `docs/hardware/`.
+   `docs/hardware/`. Imported in `f922c90`.
 8. **Not started.** Join the tracks: buttons become state machine events
    via Tokio channels, LEDs show connector status. Requires 4, 6, 7.
 9. **Not started.** Debug Probe and the serial console of the Pi over
@@ -66,11 +78,14 @@ Found during the migration inventory; carried over as is
 (see `docs/decisions/0002-as-is-migration.md`).
 
 - [x] Handle `interval = 0` from the server (`tokio::time::interval`
-      panics today). Done in step 3e.
+      panics today). Done in step 3e,
+      [#5](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/5).
 - [x] Retry BootNotification after `interval` on `Pending` / `Rejected`
-      instead of exiting. Done in step 3e.
+      instead of exiting. Done in step 3e,
+      [#5](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/5).
 - [x] A failing Heartbeat (timeout, CALLERROR) should not exit the program.
-      Done in step 3e2.
+      Done in step 3e2,
+      [#6](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/6).
 - [ ] Detect half-open connections with WebSocket ping
       (`WebSocketPingInterval`, OCPP-J 2.0.1 §8.4). Today a connection whose
       peer vanished without a TCP reset is noticed only when a write fails.
