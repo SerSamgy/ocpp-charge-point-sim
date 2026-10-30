@@ -17,7 +17,7 @@ both tracks. Status: **done**, **in progress** or **not started**.
    - [x] cargo workspace (done by the migration)
    - [x] **3e.** Retry BootNotification on `Rejected` / `Pending`,
          connection timeout, guard against `interval = 0`.
-   - [ ] **3e2.** Reconnect with backoff after a lost connection
+   - [x] **3e2.** Reconnect with backoff after a lost connection
          (OCPP 2.0.1 part 4 §5.4 algorithm, `rand` for jitter); a failing
          Heartbeat or BootNotification CALL does not exit the program.
    - [ ] **3f.** Graceful shutdown on Ctrl+C.
@@ -69,8 +69,18 @@ Found during the migration inventory; carried over as is
       panics today). Done in step 3e.
 - [x] Retry BootNotification after `interval` on `Pending` / `Rejected`
       instead of exiting. Done in step 3e.
-- [ ] A failing Heartbeat (timeout, CALLERROR) should not exit the program.
-      Part of step 3e2.
+- [x] A failing Heartbeat (timeout, CALLERROR) should not exit the program.
+      Done in step 3e2.
+- [ ] Detect half-open connections with WebSocket ping
+      (`WebSocketPingInterval`, OCPP-J 2.0.1 §8.4). Today a connection whose
+      peer vanished without a TCP reset is noticed only when a write fails.
+- [ ] Until WebSocket ping exists: treat N consecutive Heartbeat timeouts
+      as a lost connection and reconnect, a cheap safety net.
+- [ ] After a reconnect without BootNotification, send StatusNotification
+      for every connector again (step 4).
+- [ ] Make the reconnect back-off settings (`RetryBackOffWaitMinimum`,
+      `RetryBackOffRandomRange`, `RetryBackOffRepeatTimes`) configurable;
+      today they are constants in `crates/cp-sim/src/main.rs`.
 - [ ] Extract an `ocpp-proto` library crate (see `docs/archive/`).
 - [ ] Turn `cp-blink` into a hardware library (pin table, `Button`,
       debounce) with the experiments as examples.
