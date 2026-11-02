@@ -64,8 +64,14 @@ Layout:
     revert spot check it asks for.
   - Do not pass `model` or `effort` when invoking them; their
     frontmatter sets both.
-  - Show the owner every finding and what was done with it: fixed (with
-    the commit), rejected (with the reason) or moved to the backlog.
+  - Show the owner every finding by its ID (`P1`... for plans, `R1`...
+    for PRs) and what was done with it: fixed (with the commit or the
+    changed plan step), rejected (with the reason) or moved to the
+    backlog.
+  - The owner may answer by ID, e.g. "accept P2 and P4, P3 stays
+    rejected". Apply exactly that, show the revised plan with what
+    changed per ID, and review it again; owner feedback starts a new
+    count of runs.
   - Re-review: while a run has a blocker or should fix, handle them and
     run the same reviewer again, passing the earlier findings and what
     was done with each. Stop when a run has no new blocker or should

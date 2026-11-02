@@ -88,8 +88,10 @@ Two [subagents](https://code.claude.com/docs/en/sub-agents) in
 `.claude/agents/` review the agent's work before the owner sees it.
 `CLAUDE.md` says when they run. Each starts with a fresh context (it
 loads `CLAUDE.md`, but not the conversation), so the main agent passes
-the plan and the owner's requests in the prompt. Both return findings
-as blocker / should fix / nit and fix nothing. A run with a blocker or
+the plan and the owner's requests in the prompt. Both return numbered
+findings (`P1`... and `R1`...) as blocker / should fix / nit and fix
+nothing. `plan-reviewer` writes in Russian, since the owner reads its
+findings directly; `pr-reviewer` writes in English. A run with a blocker or
 should fix is followed by another one, at most three per plan or push
 (`CLAUDE.md`, Workflow).
 
