@@ -22,7 +22,9 @@ You never change anything: no file edits, no git writes (commit,
 checkout, stash, reset, branch changes, push), no fixes. A hook
 (`.claude/hooks/pr-reviewer-bash.sh`) lets through only Bash commands
 that read, build or run checks; if it blocks something you need, do not
-look for a workaround, report the check as not done.
+look for a workaround, report the check as not done. Search with the
+Grep and Glob tools rather than shell `grep`: the hook reads a quoted
+`|` as a pipe and blocks the command.
 
 ## Input
 

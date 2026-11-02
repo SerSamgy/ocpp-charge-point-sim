@@ -70,10 +70,10 @@ Instructions for the agent: `CLAUDE.md`.
 [Claude Code](https://code.claude.com/docs/en/settings):
 
 - **Permissions.** What runs without asking (build, test, the `just`
-  check recipes, local git, read-only `gh`), what needs confirmation (push, PR creation,
-  dependency changes, deploy, edits to the safety files) and what is
-  denied (merging, force-push, skipping the commit hook, reading
-  credentials). Rationale and known gaps:
+  check recipes, local git, read-only `gh`), what needs confirmation
+  (push, PR creation, dependency changes, deploy, edits to the safety
+  files) and what is denied (merging, force-push, skipping the commit
+  hook, reading credentials). Rationale and known gaps:
   `docs/decisions/0005-agent-permission-policy.md`.
 - **Shell.** `CLAUDE_CODE_SHELL=/bin/bash` in the `env` block makes the
   Bash tool use bash whatever the login shell is. Claude Code supports
@@ -108,8 +108,10 @@ as blocker / should fix / nit and fix nothing.
   while the subagent runs. It is an allowlist: read-only `git` and `gh`,
   `cargo` build, check, test and clippy without `--fix`, `cargo fmt
   --check`, the `just` check recipes and a few read-only text tools. It
-  blocks output redirection, command substitution and background jobs,
-  and anything it cannot parse (e.g. a quoted `|`). It needs `jq`.
+  blocks output redirection, command substitution, background jobs,
+  paths to credentials (`.env`, `.ssh`, `*.pem`, ...), options that run
+  helper programs (`git --ext-diff`, `cargo --config`), and anything it
+  cannot parse (e.g. a quoted `|`). It needs `jq`.
 - **Hooks need workspace trust.** Frontmatter hooks of project subagents
   run only after the folder is trusted, and never in `claude -p`. In an
   untrusted session `pr-reviewer` has unguarded Bash, still limited by

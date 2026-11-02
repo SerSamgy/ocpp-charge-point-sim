@@ -35,6 +35,11 @@ segments=$(sed -E 's/&&|\|\||;|\|/\n/g' <<<"$rest")
 case $segments in
     *'&'*) deny "background job" ;;
 esac
+# Credentials stay unreadable through Bash too, like the Read deny rules
+# in .claude/settings.json.
+if grep -Eq '\.env|\.ssh|\.aws|\.config/gh|\.pem|\.key' <<<"$segments"; then
+    deny "path to credentials"
+fi
 
 has_arg() { # has_arg <regex> <words...>: some word matches the regex
     local re=$1 w
@@ -57,6 +62,8 @@ while IFS= read -r segment; do
                 *) deny "git ${w[1]:-}" ;;
             esac
             ! has_arg '^(--output|-o)' "${w[@]:2}" || deny "git writing to a file"
+            # Run helper programs named in the git config.
+            ! has_arg '^--(ext-diff|textconv)' "${w[@]:2}" || deny "git ${w[1]} running a helper"
             ;;
         cargo)
             case ${w[1]:-} in
@@ -65,11 +72,13 @@ while IFS= read -r segment; do
                 *) deny "cargo ${w[1]:-}" ;;
             esac
             ! has_arg '^--fix' "${w[@]:2}" || deny "cargo --fix"
+            # `--config build.rustc-wrapper=...` runs any program.
+            ! has_arg '^--config' "${w[@]:2}" || deny "cargo --config"
             ;;
         just)
             case ${w[1]:-} in
                 '' | --list | -l | ci | ci-rust | ci-python | test | check-docs) [ "${#w[@]}" -le 2 ] || deny "arguments to just ${w[1]}" ;;
-                test-commits) [ "${#w[@]}" -le 3 ] && [[ ${w[2]:-main} =~ ^[A-Za-z0-9._/~^-]+$ ]] || deny "just test-commits ${w[*]:2}" ;;
+                test-commits) [ "${#w[@]}" -le 3 ] && [[ ${w[2]:-main} =~ ^[A-Za-z0-9][A-Za-z0-9._/~^-]*$ ]] || deny "just test-commits ${w[*]:2}" ;;
                 *) deny "just ${w[1]}" ;;
             esac
             ;;
@@ -78,9 +87,11 @@ while IFS= read -r segment; do
                 'pr view' | 'pr diff' | 'pr checks' | 'pr list' | 'run view' | 'run list') ;;
                 *) deny "gh ${w[1]:-} ${w[2]:-}" ;;
             esac
+            ! has_arg '^--watch' "${w[@]:3}" || deny "gh --watch never returns"
             ;;
-        sort) ! has_arg '^(-o|--output)' "${w[@]:1}" || deny "sort writing to a file" ;;
-        ls | cat | head | tail | wc | grep | uniq | cut | tr | diff | pwd | echo | cd) ;;
+        # No `sort` or `uniq`: both write files (`sort --out=f`, with any
+        # abbreviation of --output, and `uniq in out`).
+        ls | cat | head | tail | wc | grep | cut | tr | diff | pwd | echo | cd) ;;
         *) deny "${w[0]} is not on the list" ;;
     esac
 done <<<"$segments"
