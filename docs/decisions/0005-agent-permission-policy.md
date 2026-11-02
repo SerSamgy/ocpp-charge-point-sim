@@ -94,3 +94,7 @@ Known limitations:
   filesystem and network limits for shell commands independently of the
   command text. Enabling it and tightening the rules are tracked in
   `docs/roadmap.md`.
+
+> Update: the `just` check recipes `ci`, `ci-rust`, `ci-python`,
+> `check-docs` and `test-commits` are now allowed too, for the PR
+> reviewer subagent; see "Review subagents" in `docs/development.md`.

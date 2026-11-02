@@ -69,8 +69,8 @@ Instructions for the agent: `CLAUDE.md`.
 `.claude/settings.json` is the shared project settings file of
 [Claude Code](https://code.claude.com/docs/en/settings):
 
-- **Permissions.** What runs without asking (build, test, local git,
-  read-only `gh`), what needs confirmation (push, PR creation,
+- **Permissions.** What runs without asking (build, test, the `just`
+  check recipes, local git, read-only `gh`), what needs confirmation (push, PR creation,
   dependency changes, deploy, edits to the safety files) and what is
   denied (merging, force-push, skipping the commit hook, reading
   credentials). Rationale and known gaps:
@@ -81,6 +81,46 @@ Instructions for the agent: `CLAUDE.md`.
   permission rules from matching the real command.
 
 Personal overrides go into `.claude/settings.local.json`.
+
+### Review subagents
+
+Two [subagents](https://code.claude.com/docs/en/sub-agents) in
+`.claude/agents/` review the agent's work before the owner sees it.
+`CLAUDE.md` says when they run. Each starts with a fresh context (it
+loads `CLAUDE.md`, but not the conversation), so the main agent passes
+the plan and the owner's requests in the prompt. Both return findings
+as blocker / should fix / nit and fix nothing.
+
+| Subagent | When | Tools | Model, effort |
+|---|---|---|---|
+| `plan-reviewer` | before a plan is presented | `Read`, `Grep`, `Glob` | `opus`, `medium` |
+| `pr-reviewer` | before every push | `Read`, `Grep`, `Glob`, `Bash` behind a hook | `sonnet`, `medium` |
+
+- **Model and effort** are set in the frontmatter so they do not follow
+  the main session. A `model` or `effort` passed with an invocation, and
+  the environment variables `CLAUDE_CODE_SUBAGENT_MODEL` (only when the
+  field is missing) and `CLAUDE_CODE_EFFORT_LEVEL` (always), would
+  override them; `CLAUDE.md` forbids the first, the variables are not
+  set in this project.
+- **Bash for `pr-reviewer`.** The `tools` field cannot allow only some
+  Bash commands, so a PreToolUse hook declared in the agent's
+  frontmatter, `.claude/hooks/pr-reviewer-bash.sh`, checks every command
+  while the subagent runs. It is an allowlist: read-only `git` and `gh`,
+  `cargo` build, check, test and clippy without `--fix`, `cargo fmt
+  --check`, the `just` check recipes and a few read-only text tools. It
+  blocks output redirection, command substitution and background jobs,
+  and anything it cannot parse (e.g. a quoted `|`). It needs `jq`.
+- **Hooks need workspace trust.** Frontmatter hooks of project subagents
+  run only after the folder is trusted, and never in `claude -p`. In an
+  untrusted session `pr-reviewer` has unguarded Bash, still limited by
+  the permission rules above.
+- **Per-commit check.** `just test-commits base` exports each commit
+  since `base` with `git archive` into a temporary directory and runs
+  `cargo test --locked --workspace` there; the build cache lives in
+  `target/test-commits`. `pr-reviewer` runs it, and so can anyone.
+- **Revert spot check.** `pr-reviewer` cannot change files, so it names
+  the lines to revert and the test that should fail; the main agent runs
+  that check.
 
 ## Configured outside the repository
 
