@@ -33,8 +33,9 @@ Layout:
 - `docs/roadmap.md`: steps, statuses, backlog. Start every task here.
 - `docs/architecture.md`: map of the code: modules, message flow,
   invariants with their tests, OCPP 2.0.1 extension points.
-- `docs/development.md`: tools, cross-build, CI, agent settings, and
-  GitHub settings configured outside the repository.
+- `docs/development.md`: tools, cross-build, CI, agent settings and
+  review subagents, and GitHub settings configured outside the
+  repository.
 - `docs/decisions/`: ADRs (architecture decision records). Read the
   relevant ones before changing what they cover.
 - `docs/hardware/`: pin table and wiring notes.
@@ -55,6 +56,16 @@ Layout:
 - Non-trivial task: explore, propose a plan (plan mode when available),
   wait for approval before editing files. If the task clearly exceeds one
   or two evenings, propose splitting it.
+- Review gates, subagents in `.claude/agents/`:
+  - `plan-reviewer` before presenting a plan: pass the task as stated
+    and the full plan.
+  - `pr-reviewer` before every push: pass the approved plan, every
+    change the owner requested since, and the base branch. Run the
+    revert spot check it asks for.
+  - Do not pass `model` or `effort` when invoking them; their
+    frontmatter sets both.
+  - Show the owner every finding and what was done with it: fixed (with
+    the commit), rejected (with the reason) or moved to the backlog.
 - Out-of-scope findings go to the roadmap backlog, not into the PR.
 - Small commits, one logical change each. The workspace builds and tests
   pass after every commit. Refactoring is separate from behaviour changes.
