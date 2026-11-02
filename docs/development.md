@@ -113,7 +113,10 @@ should fix is followed by another one, at most three per plan or push
   blocks output redirection, command substitution, background jobs,
   paths to credentials (`.env`, `.ssh`, `*.pem`, ...), options that run
   helper programs (`git --ext-diff`, `cargo --config`), and anything it
-  cannot parse (e.g. a quoted `|`). It needs `jq`.
+  cannot parse (e.g. a quoted `|`). It needs `jq`. Text matching cannot
+  see through quotes and globs (`cat .e""nv`, `cat ~/.ss?/id_rsa`) or
+  stop reads outside the repository; the Bash sandbox in the roadmap
+  backlog is what would close that.
 - **Hooks need workspace trust.** Frontmatter hooks of project subagents
   run only after the folder is trusted, and never in `claude -p`. In an
   untrusted session `pr-reviewer` has unguarded Bash, still limited by
