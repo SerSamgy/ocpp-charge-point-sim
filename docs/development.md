@@ -91,9 +91,9 @@ loads `CLAUDE.md`, but not the conversation), so the main agent passes
 the plan and the owner's requests in the prompt. Both return numbered
 findings (`P1`... and `R1`...) as blocker / should fix / nit and fix
 nothing. `plan-reviewer` writes in Russian, since the owner reads its
-findings directly; `pr-reviewer` writes in English. A run with a blocker or
-should fix is followed by another one, at most three per plan or push
-(`CLAUDE.md`, Workflow).
+findings directly; `pr-reviewer` writes in English. A run with a
+blocker or should fix is followed by another one, at most three per
+plan or push (`CLAUDE.md`, Workflow).
 
 | Subagent | When | Tools | Model, effort |
 |---|---|---|---|
