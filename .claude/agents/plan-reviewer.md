@@ -21,6 +21,10 @@ checked with the tools you have, say so in the finding.
 The prompt gives you the task as the owner stated it and the full plan.
 If either is missing, return a single blocker saying so and stop.
 
+On a re-review the prompt also lists the earlier findings and what was
+done with each. Check that the fixes work; do not raise a rejected
+finding again unless you have a new argument, and then say what is new.
+
 ## What to read
 
 Read only what the plan touches, but always:

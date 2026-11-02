@@ -32,6 +32,10 @@ The prompt gives you the approved plan, the changes the owner requested
 after it, and the base branch (usually `main`). If the plan is missing,
 return a single blocker saying so and stop.
 
+On a re-review the prompt also lists the earlier findings and what was
+done with each. Check that the fixes work; do not raise a rejected
+finding again unless you have a new argument, and then say what is new.
+
 ## Steps
 
 1. Read `CLAUDE.md`: the workflow and convention rules are part of the
