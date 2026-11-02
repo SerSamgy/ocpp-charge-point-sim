@@ -34,11 +34,12 @@ message hook.
 ## Commands
 
 ```sh
-just test       # Rust tests for the whole workspace
-just ci         # everything CI runs, except the commit message check
-just csms       # start the test CSMS on ws://0.0.0.0:9000/<charge_point_id>
-just build-pi   # static aarch64 musl binaries in target/aarch64-unknown-linux-musl/release/
-just deploy     # scp the cp-sim binary to $PI_HOST (default: cp-sim)
+just test          # Rust tests for the whole workspace
+just ci            # everything CI runs, except the commit message check
+just test-commits  # build and test each commit since main on its own
+just csms          # start the test CSMS on ws://0.0.0.0:9000/<charge_point_id>
+just build-pi      # static aarch64 musl binaries in target/aarch64-unknown-linux-musl/release/
+just deploy        # scp the cp-sim binary to $PI_HOST (default: cp-sim)
 ```
 
 ## Further reading
