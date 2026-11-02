@@ -58,6 +58,31 @@ check-docs doc="docs/architecture.md":
     fi
     exit $status
 
+# Build and test every commit of the current branch since `base`, each on a clean export
+test-commits base="main":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # A `git archive` export instead of a checkout: the working tree, the
+    # index and HEAD stay untouched, and uncommitted changes cannot leak in.
+    work=$(mktemp -d)
+    trap 'rm -rf "$work"' EXIT
+    # Shared between runs and commits, so only the first build is slow.
+    export CARGO_TARGET_DIR="$PWD/target/test-commits"
+    commits=$(git rev-list --reverse "{{base}}..HEAD")
+    if [ -z "$commits" ]; then
+        echo "test-commits: no commits between {{base}} and HEAD" >&2
+        exit 1
+    fi
+    for sha in $commits; do
+        echo "test-commits: $(git log -1 --format='%h %s' "$sha")"
+        rm -rf "$work/src"
+        mkdir "$work/src"
+        git archive "$sha" | tar -x -C "$work/src"
+        # From inside the export, so rustup picks that commit's toolchain.
+        (cd "$work/src" && cargo test --locked --workspace --quiet)
+    done
+    echo "test-commits: all $(wc -w <<<"$commits") commits build and pass the tests"
+
 # CI job `python`: ruff lint and format check for the test CSMS
 ci-python:
     cd csms && uv run --locked ruff check
