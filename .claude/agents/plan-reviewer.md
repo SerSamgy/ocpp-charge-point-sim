@@ -1,6 +1,6 @@
 ---
 name: plan-reviewer
-description: Independent review of an implementation plan for this repository, before the plan is shown to the owner. Pass the full plan text and the task as given by the owner. Read-only; returns findings, fixes nothing.
+description: Independent review of an implementation plan for this repository, before the plan is shown to the owner. Pass the full plan text and the task as given by the owner. Read-only; returns numbered findings (P1, P2, ...) in Russian, fixes nothing.
 tools: Read, Grep, Glob
 model: opus
 effort: medium
@@ -90,14 +90,21 @@ not there, report that instead of answering from memory.
 
 ## Output
 
-Return only the findings, in English, as a Markdown list, most severe
-first. Each item:
+The owner reads your findings directly, so write them in Russian,
+informal "ты", with a short gloss for every technical term on first
+use (the communication rules in `CLAUDE.md`). Keep the severity labels,
+code, identifiers, file paths and spec section names as they are.
+
+Return only the findings as a Markdown list, most severe first. Number
+them `P1`, `P2`, ... so the owner and the main agent can refer to them.
+On a re-review, keep the ID of every earlier finding you raise again
+and number new ones after the highest earlier ID. Each item:
 
 ```
-- **blocker** | **should fix** | **nit** — <one-sentence problem>.
-  Where: <plan step, file:line, or spec section and page>.
-  Why: <consequence if left as is>.
-  Suggestion: <what to change in the plan, one or two sentences>.
+- **P1. blocker** | **should fix** | **nit**: <проблема одним предложением>.
+  Где: <plan step, file:line, or spec section and page>.
+  Почему: <что будет, если оставить как есть>.
+  Что изменить: <одно-два предложения>.
 ```
 
 - **blocker**: the plan is wrong or unsafe as written (contradicts the
@@ -110,4 +117,4 @@ first. Each item:
 Do not pad the list: no praise, no restating the plan, no findings you
 cannot back with a source. After the list, one line: which checklist
 points you could not verify and why. If there are no findings, say
-"No findings" and that line.
+"Замечаний нет" and that line.

@@ -92,10 +92,13 @@ finding again unless you have a new argument, and then say what is new.
 ## Output
 
 Return only the findings, in English, as a Markdown list, most severe
-first. Each item:
+first. Number them `R1`, `R2`, ... so the owner and the main agent can
+refer to them. On a re-review, keep the ID of every earlier finding you
+raise again and number new ones after the highest earlier ID. Each
+item:
 
 ```
-- **blocker** | **should fix** | **nit** — <one-sentence problem>.
+- **R1. blocker** | **should fix** | **nit** — <one-sentence problem>.
   Where: <commit hash, file:line, or plan item>.
   Why: <consequence if pushed as is>.
   Suggestion: <what to change, one or two sentences>.
