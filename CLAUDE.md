@@ -66,6 +66,11 @@ Layout:
     frontmatter sets both.
   - Show the owner every finding and what was done with it: fixed (with
     the commit), rejected (with the reason) or moved to the backlog.
+  - Re-review: while a run has a blocker or should fix, handle them and
+    run the same reviewer again, passing the earlier findings and what
+    was done with each. Stop when a run has no new blocker or should
+    fix; nits may stay. At most three runs per plan or push: after the
+    third, stop and show the owner what is left.
 - Out-of-scope findings go to the roadmap backlog, not into the PR.
 - Small commits, one logical change each. The workspace builds and tests
   pass after every commit. Refactoring is separate from behaviour changes.

@@ -89,7 +89,9 @@ Two [subagents](https://code.claude.com/docs/en/sub-agents) in
 `CLAUDE.md` says when they run. Each starts with a fresh context (it
 loads `CLAUDE.md`, but not the conversation), so the main agent passes
 the plan and the owner's requests in the prompt. Both return findings
-as blocker / should fix / nit and fix nothing.
+as blocker / should fix / nit and fix nothing. A run with a blocker or
+should fix is followed by another one, at most three per plan or push
+(`CLAUDE.md`, Workflow).
 
 | Subagent | When | Tools | Model, effort |
 |---|---|---|---|
