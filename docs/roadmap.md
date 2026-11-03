@@ -135,12 +135,6 @@ Found during the migration inventory; carried over as is
       (`<id>` and the like in doc comments read as unclosed HTML tags),
       then consider `cargo doc` with `RUSTDOCFLAGS=-D warnings` in
       `just ci`.
-- [ ] Fix `just test-commits`: `git archive` gives the exported files
-      their commit time, which is older than the previous build in the
-      shared `target/test-commits`, so cargo takes later commits for
-      unchanged and tests the first commit's binary again. Extract with
-      `tar -m` (or touch the sources); check by watching the test count
-      grow across commits that add tests.
 - [ ] Let crates inherit `edition` from `[workspace.package]`.
 - [ ] Agent permissions, follow-ups to
       `docs/decisions/0005-agent-permission-policy.md`:

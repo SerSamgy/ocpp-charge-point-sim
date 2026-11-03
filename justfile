@@ -77,7 +77,11 @@ test-commits base="main":
         echo "test-commits: $(git log -1 --format='%h %s' "$sha")"
         rm -rf "$work/src"
         mkdir "$work/src"
-        git archive "$sha" | tar -x -C "$work/src"
+        # `-m`: give the files the time of extraction. `git archive` stores
+        # the commit time, which is older than the last build in the shared
+        # target directory, so cargo would take the sources for unchanged
+        # and test the previous commit's binary again.
+        git archive "$sha" | tar -x -m -C "$work/src"
         # From inside the export, so rustup picks that commit's toolchain.
         (cd "$work/src" && cargo test --locked --workspace --quiet)
     done

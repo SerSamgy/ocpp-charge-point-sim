@@ -126,7 +126,11 @@ plan or push (`CLAUDE.md`, Workflow).
 - **Per-commit check.** `just test-commits base` exports each commit
   since `base` with `git archive` into a temporary directory and runs
   `cargo test --locked --workspace` there; the build cache lives in
-  `target/test-commits`. `pr-reviewer` runs it, and so can anyone.
+  `target/test-commits`. The export is extracted with `tar -m`, so the
+  files get the extraction time: cargo decides what to rebuild by file
+  times, and the commit times that `git archive` stores are older than
+  the previous build, which made cargo reuse the first commit's binary.
+  `pr-reviewer` runs it, and so can anyone.
 - **Revert spot check.** `pr-reviewer` cannot change files, so it names
   the lines to revert and the test that should fail; the main agent runs
   that check.
