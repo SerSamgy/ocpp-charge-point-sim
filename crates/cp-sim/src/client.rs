@@ -409,7 +409,7 @@ mod tests {
             .await
             .expect("reader task did not stop")
             .expect("reader task panicked");
-        assert!(matches!(csms.recv_event().await, Event::Closed));
+        assert!(matches!(csms.recv_event().await, Event::Closed { .. }));
 
         let (_client, _reader) = Client::connect(&csms.url, timeouts(LONG)).await.unwrap();
         assert!(matches!(csms.recv_event().await, Event::Connected));
@@ -479,7 +479,12 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(matches!(err, CallFailure::Disconnected), "got {err:?}");
-        assert!(matches!(csms.recv_event().await, Event::Closed));
+        // `close` sends a Close frame without a status code.
+        let closed = csms.recv_event().await;
+        assert!(
+            matches!(closed, Event::Closed { code: None }),
+            "got {closed:?}"
+        );
         timeout(Duration::from_secs(1), reader)
             .await
             .expect("reader task did not stop")

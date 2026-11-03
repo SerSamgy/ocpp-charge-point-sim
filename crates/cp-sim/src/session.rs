@@ -279,7 +279,7 @@ mod tests {
     /// Waits for the client to come back after `Event::Closed`; returns how
     /// long that took.
     async fn reconnect_gap(csms: &mut FakeCsms) -> Duration {
-        assert!(matches!(csms.recv_event().await, Event::Closed));
+        assert!(matches!(csms.recv_event().await, Event::Closed { .. }));
         let closed = Instant::now();
         assert!(matches!(
             csms.recv_event_within(LONG).await,
@@ -339,7 +339,7 @@ mod tests {
         let answered = Instant::now();
 
         // The client closes the connection instead of staying silent on it.
-        assert!(matches!(csms.recv_event().await, Event::Closed));
+        assert!(matches!(csms.recv_event().await, Event::Closed { .. }));
         assert!(matches!(
             csms.recv_event_within(HEARTBEAT_WAIT).await,
             Event::Connected
