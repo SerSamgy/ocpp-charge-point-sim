@@ -8,6 +8,7 @@ use tokio::{
     task::JoinHandle,
     time::{MissedTickBehavior, interval, sleep, timeout},
 };
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use crate::{
     backoff::{Backoff, BackoffConfig},
@@ -55,7 +56,13 @@ pub async fn run(url: &str, settings: Settings, request: &BootNotificationReques
                     }
                     Ended::Rejected { after } => {
                         println!("boot rejected, reconnecting in {after:?}");
-                        disconnect(&client, &mut reader, settings.timeouts.call).await;
+                        disconnect(
+                            &client,
+                            &mut reader,
+                            settings.timeouts.call,
+                            CloseCode::Normal,
+                        )
+                        .await;
                         after
                     }
                 }
@@ -172,8 +179,13 @@ impl Station<'_> {
 /// Closes the connection and waits up to `wait` for the reader task to finish;
 /// aborts it if the server does not complete the closing handshake.
 /// Returns true if the reader finished on its own.
-async fn disconnect(client: &Client, reader: &mut JoinHandle<()>, wait: Duration) -> bool {
-    if let Err(err) = client.close().await {
+async fn disconnect(
+    client: &Client,
+    reader: &mut JoinHandle<()>,
+    wait: Duration,
+    code: CloseCode,
+) -> bool {
+    if let Err(err) = client.close(code).await {
         eprintln!("failed to send Close: {err}");
     }
     if timeout(wait, &mut *reader).await.is_ok() {
@@ -339,7 +351,11 @@ mod tests {
         let answered = Instant::now();
 
         // The client closes the connection instead of staying silent on it.
-        assert!(matches!(csms.recv_event().await, Event::Closed { .. }));
+        let closed = csms.recv_event().await;
+        assert!(
+            matches!(closed, Event::Closed { code: Some(1000) }),
+            "got {closed:?}"
+        );
         assert!(matches!(
             csms.recv_event_within(HEARTBEAT_WAIT).await,
             Event::Connected
@@ -502,7 +518,7 @@ mod tests {
         csms.recv().await; // the Heartbeat is in flight, never answered
 
         assert!(
-            disconnect(&client, &mut reader, LONG).await,
+            disconnect(&client, &mut reader, LONG, CloseCode::Normal).await,
             "reader task did not finish on its own"
         );
 

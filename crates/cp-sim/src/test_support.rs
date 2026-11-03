@@ -21,7 +21,7 @@ use crate::frame::Frame;
     clippy::result_large_err,
     reason = "the signature is dictated by tungstenite's handshake `Callback` impl for closures, so the large `Err` variant cannot be boxed"
 )]
-fn echo_ocpp16(_req: &HsRequest, mut resp: Response) -> Result<Response, ErrorResponse> {
+pub fn echo_ocpp16(_req: &HsRequest, mut resp: Response) -> Result<Response, ErrorResponse> {
     resp.headers_mut().insert(
         "Sec-WebSocket-Protocol",
         HeaderValue::from_static("ocpp1.6"),
