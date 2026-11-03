@@ -16,7 +16,7 @@ instead.
 2. **Done.** BootNotification and Heartbeat in the Rust client
    (`crates/cp-sim`); runs on the laptop and on the Pi. Imported in
    `2e2ecf2`.
-3. **In progress.** Protocol core.
+3. **Done.** Protocol core.
    - [x] OCPP-J `Frame` (CALL, CALLRESULT, CALLERROR). Imported in
          `2e2ecf2`.
    - [x] typed messages (`Request` trait with action and response type).
@@ -32,7 +32,9 @@ instead.
          (OCPP 2.0.1 part 4 §5.4 algorithm, `rand` for jitter); a failing
          Heartbeat or BootNotification CALL does not exit the program.
          [#6](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/6)
-   - [ ] **3f.** Graceful shutdown on Ctrl+C.
+   - [x] **3f.** Graceful shutdown on Ctrl+C and SIGTERM: Close 1001
+         Going Away, bounded by a close timeout.
+         [#10](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/10)
 4. **Not started.** Connector state machine: Available → Preparing →
    Charging → Finishing → Available, plus Faulted. StatusNotification on
    every transition. Events come from the keyboard for now.
@@ -52,7 +54,7 @@ instead.
 
 ## Suggested order
 
-3e2 → 3f → 4 → 8 → 5 → 10; 9 at any time.
+4 → 8 → 5 → 10; 9 at any time.
 
 ## Larger blocks after that
 
@@ -91,6 +93,17 @@ Found during the migration inventory; carried over as is
       peer vanished without a TCP reset is noticed only when a write fails.
 - [ ] Until WebSocket ping exists: treat N consecutive Heartbeat timeouts
       as a lost connection and reconnect, a cheap safety net.
+- [ ] On shutdown, let a CALL in flight finish (up to its timeout)
+      before closing; today it is cancelled (step 3f).
+- [ ] A second Ctrl+C exits at once instead of waiting up to the close
+      timeout (step 3f).
+- [ ] Reply to the server's Close when the connection ends as lost:
+      `read_loop` stops at the server's Close, and tungstenite sends the
+      queued reply only on the next read, write or flush, so the server
+      sees an abnormal closure (1006). `Client::close` already flushes it
+      on shutdown and after Rejected (step 3f).
+- [ ] `read_loop` logs every received Close as "server closed
+      connection", also when it is the server's reply to our own Close.
 - [ ] After a reconnect without BootNotification, send StatusNotification
       for every connector again (step 4).
 - [ ] Make the reconnect back-off settings (`RetryBackOffWaitMinimum`,
