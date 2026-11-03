@@ -75,8 +75,11 @@ async def on_connect(websocket):
     logger.info(f"Charge point {charge_point_id} connected ({websocket.subprotocol})")
     try:
         await ChargePoint(charge_point_id, websocket).start()
-    except websockets.exceptions.ConnectionClosed:
-        logger.info(f"Charge point {charge_point_id} disconnected")
+    except websockets.exceptions.ConnectionClosed as exc:
+        # The Close frame the charge point sent, if any (RFC 6455 7.4.1).
+        close = exc.rcvd
+        reason = f"code {close.code} {close.reason!r}" if close else "no Close frame"
+        logger.info(f"Charge point {charge_point_id} disconnected: {reason}")
 
 
 async def main():
