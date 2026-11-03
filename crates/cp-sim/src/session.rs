@@ -44,9 +44,21 @@ pub async fn run(url: &str, settings: Settings, request: &BootNotificationReques
     };
     loop {
         let wait = match Client::connect(url, settings.timeouts).await {
-            Ok((client, reader)) => {
+            Ok((client, mut reader)) => {
                 println!("connected to {url}");
-                station.serve(&client, reader).await
+                match station.serve(&client, &mut reader).await {
+                    Ended::Lost => {
+                        // Usually finished already; if the socket broke only on
+                        // the sending side, stop the reader so it does not linger.
+                        reader.abort();
+                        station.backoff.next_delay(&mut station.rng)
+                    }
+                    Ended::Rejected { after } => {
+                        println!("boot rejected, reconnecting in {after:?}");
+                        disconnect(&client, &mut reader, settings.timeouts.call).await;
+                        after
+                    }
+                }
             }
             Err(err) => {
                 eprintln!("cannot connect to {url}: {err}");
@@ -77,31 +89,19 @@ enum Ended {
 }
 
 impl Station<'_> {
-    /// Uses one connection until it ends; returns the wait before the next one.
-    async fn serve(&mut self, client: &Client, mut reader: JoinHandle<()>) -> Duration {
-        let ended = match self.heartbeat {
-            Some(every) => self.keep_alive(client, &mut reader, every).await,
-            None => match self.boot(client, &mut reader).await {
+    /// Uses one connection until it ends and says why it ended; closing
+    /// the connection and waiting before the next one is up to `run`.
+    async fn serve(&mut self, client: &Client, reader: &mut JoinHandle<()>) -> Ended {
+        match self.heartbeat {
+            Some(every) => self.keep_alive(client, reader, every).await,
+            None => match self.boot(client, reader).await {
                 Ok(every) => {
                     println!("accepted, heartbeat every {every:?}");
                     self.heartbeat = Some(every);
-                    self.keep_alive(client, &mut reader, every).await
+                    self.keep_alive(client, reader, every).await
                 }
                 Err(ended) => ended,
             },
-        };
-        match ended {
-            Ended::Lost => {
-                // Usually finished already; if the socket broke only on the
-                // sending side, stop the reader so it does not linger.
-                reader.abort();
-                self.backoff.next_delay(&mut self.rng)
-            }
-            Ended::Rejected { after } => {
-                println!("boot rejected, reconnecting in {after:?}");
-                disconnect(client, reader, self.settings.timeouts.call).await;
-                after
-            }
         }
     }
 
@@ -172,11 +172,11 @@ impl Station<'_> {
 /// Closes the connection and waits up to `wait` for the reader task to finish;
 /// aborts it if the server does not complete the closing handshake.
 /// Returns true if the reader finished on its own.
-async fn disconnect(client: &Client, mut reader: JoinHandle<()>, wait: Duration) -> bool {
+async fn disconnect(client: &Client, reader: &mut JoinHandle<()>, wait: Duration) -> bool {
     if let Err(err) = client.close().await {
         eprintln!("failed to send Close: {err}");
     }
-    if timeout(wait, &mut reader).await.is_ok() {
+    if timeout(wait, &mut *reader).await.is_ok() {
         return true;
     }
     eprintln!("server did not finish the closing handshake, dropping the connection");
@@ -492,7 +492,7 @@ mod tests {
     #[tokio::test]
     async fn disconnect_finishes_reader_and_fails_calls_on_old_client() {
         let mut csms = FakeCsms::start().await;
-        let (client, reader) = Client::connect(&csms.url, settings(LONG).timeouts)
+        let (client, mut reader) = Client::connect(&csms.url, settings(LONG).timeouts)
             .await
             .unwrap();
         let waiting = {
@@ -502,7 +502,7 @@ mod tests {
         csms.recv().await; // the Heartbeat is in flight, never answered
 
         assert!(
-            disconnect(&client, reader, LONG).await,
+            disconnect(&client, &mut reader, LONG).await,
             "reader task did not finish on its own"
         );
 
