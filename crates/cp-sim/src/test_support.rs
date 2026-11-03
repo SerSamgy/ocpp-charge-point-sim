@@ -21,7 +21,7 @@ use crate::frame::Frame;
     clippy::result_large_err,
     reason = "the signature is dictated by tungstenite's handshake `Callback` impl for closures, so the large `Err` variant cannot be boxed"
 )]
-fn echo_ocpp16(_req: &HsRequest, mut resp: Response) -> Result<Response, ErrorResponse> {
+pub fn echo_ocpp16(_req: &HsRequest, mut resp: Response) -> Result<Response, ErrorResponse> {
     resp.headers_mut().insert(
         "Sec-WebSocket-Protocol",
         HeaderValue::from_static("ocpp1.6"),
@@ -37,7 +37,9 @@ pub enum Event {
     /// A text frame from the client.
     Frame(Frame),
     /// The current connection is gone (closed by either side or broken).
-    Closed,
+    /// `code` is the status code of the client's Close frame; None if the
+    /// client sent a Close without a code or no Close at all.
+    Closed { code: Option<u16> },
 }
 
 enum Command {
@@ -69,12 +71,18 @@ impl FakeCsms {
                 // tells us when to stop.
                 let _ = event_tx.send(Event::Connected);
                 let (mut sink, mut stream) = ws.split();
+                let mut code = None;
                 loop {
                     tokio::select! {
                         msg = stream.next() => match msg {
                             Some(Ok(Message::Text(text))) => {
                                 let frame: Frame = serde_json::from_str(&text).unwrap();
                                 let _ = event_tx.send(Event::Frame(frame));
+                            }
+                            // Keep reading: tungstenite sends the reply Close
+                            // on the next read, and then the stream ends.
+                            Some(Ok(Message::Close(frame))) => {
+                                code = frame.map(|f| u16::from(f.code));
                             }
                             Some(Ok(_)) => {}
                             _ => break,
@@ -97,7 +105,7 @@ impl FakeCsms {
                         },
                     }
                 }
-                let _ = event_tx.send(Event::Closed);
+                let _ = event_tx.send(Event::Closed { code });
             }
         });
 
@@ -137,7 +145,9 @@ impl FakeCsms {
             match tokio::time::timeout_at(deadline, self.events.recv()).await {
                 Ok(Some(Event::Frame(frame))) => return Some(frame),
                 Ok(Some(Event::Connected)) => continue,
-                Ok(Some(Event::Closed)) => panic!("connection closed while waiting for a frame"),
+                Ok(Some(Event::Closed { .. })) => {
+                    panic!("connection closed while waiting for a frame")
+                }
                 Ok(None) | Err(_) => return None,
             }
         }

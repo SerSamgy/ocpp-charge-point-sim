@@ -11,7 +11,7 @@ structure (crates, modules, message flow, invariants) updates this page.
 |---|---|
 | `crates/cp-sim` | The charge point: an OCPP-J client over WebSocket, Tokio runtime. One binary. |
 | `crates/cp-blink` | GPIO experiments on the Pi (`rppal`): LED, buttons, debouncing. Standalone binaries, not used by `cp-sim` yet (roadmap step 8). Pins: `docs/hardware/`. |
-| `csms/` | Python test CSMS on the `ocpp` library. Answers BootNotification (status sequence and interval configurable through `BOOT_STATUSES`, `BOOT_INTERVAL`) and Heartbeat. |
+| `csms/` | Python test CSMS on the `ocpp` library. Answers BootNotification (status sequence and interval configurable through `BOOT_STATUSES`, `BOOT_INTERVAL`) and Heartbeat; logs the close code of a disconnected charge point. |
 
 ## Modules of `cp-sim`
 
@@ -22,11 +22,11 @@ Layered from the wire up; each module uses only the ones above it.
 | `frame` | OCPP-J RPC frame: CALL, CALLRESULT, CALLERROR as a JSON array. | No, same in 1.6 and 2.0.1. |
 | `ocpp16` | OCPP 1.6 payloads; the `Request` trait ties a payload to its action name and response type. | Yes. |
 | `pending` | `PendingCalls`: outstanding CALLs by message ID, each waiting on a `oneshot` channel. | No. |
-| `client` | One WebSocket connection: `Client::call` sends a typed request and waits for the typed answer; the reader task routes incoming frames. | Partly: sub-protocol `ocpp1.6`, `ocpp16::Request`. |
+| `client` | One WebSocket connection: `Client::call` sends a typed request and waits for the typed answer; the reader task routes incoming frames; `Client::close` sends a Close frame with a status code. | Partly: sub-protocol `ocpp1.6`, `ocpp16::Request`. |
 | `boot` | Maps a BootNotification response to the next step (Accepted, Pending, Rejected). | Yes, 1.6 section 4.2. |
 | `backoff` | Wait before a reconnect, OCPP-J 2.0.1 part 4 section 5.4. | No, a transport rule. |
-| `session` | Stays connected forever: connect, boot until Accepted, Heartbeat, reconnect. Owns the state that survives a connection (`Station`). | Yes, through `boot` and `ocpp16`. |
-| `main` | Reads the CSMS URL, rejects a malformed one, fixes the settings, runs `session::run`. | Boot payload is 1.6. |
+| `session` | Stays connected until a shutdown signal: connect, boot until Accepted, Heartbeat, reconnect; on the signal, close the connection and return. Owns the state that survives a connection (`Station`). | Yes, through `boot` and `ocpp16`. |
+| `main` | Reads the CSMS URL, rejects a malformed one, fixes the settings, runs `session::run` until Ctrl+C or SIGTERM. | Boot payload is 1.6. |
 | `test_support` | Tests only: `FakeCsms`, a WebSocket server driven by the test. | 1.6 sub-protocol. |
 
 ## Message flow
@@ -49,7 +49,20 @@ Connection life cycle (`session`): connect → BootNotification until
 Accepted → Heartbeat every `interval` → on loss, wait (back-off or the
 Rejected interval) and connect again. When the reader task ends, every
 waiting and later CALL on that client fails with `Disconnected`, which is
-how `session` learns that the connection is gone.
+how `session` learns that the connection is gone. `Station::serve` uses a
+connection until it ends; `run` closes it after Rejected (status 1000) and
+picks the wait.
+
+Shutdown: `main` hands `session::run` a future that completes on Ctrl+C
+or SIGTERM. `run` races it (`tokio::select!`) against connecting, serving
+the connection and the wait before a reconnect. During `serve` the signal
+cancels whatever is in flight, sends Close 1001 Going Away and waits for
+the server's Close at most `close_timeout`; elsewhere `run` returns at
+once. The close after Rejected is deliberately not raced against the
+signal: cancelling it half way would start a second wait for the
+shutdown close, so a signal during it lets it finish (at most
+`close_timeout`) and stops `run` in the wait that follows. OCPP 1.6 and 2.0.1 define nothing for this, so the close codes come
+from RFC 6455 section 7.4.1.
 
 ## Invariants
 
@@ -70,6 +83,11 @@ does not check that a test still means what the row says; review does.
 | A failed CALL (timeout, CALLERROR) on a live connection does not end the connection or the program. | `session::failed_boot_is_retried_on_same_connection`, `session::heartbeat_call_error_keeps_connection`, `session::heartbeat_timeout_keeps_connection` |
 | Back-off grows while connecting fails and resets only after a successful OCPP exchange, not after a bare handshake. | `session::backoff_grows_while_connect_fails`, `session::handshake_alone_does_not_reset_backoff`, `session::successful_exchange_resets_backoff`, `backoff::doubles_up_to_repeat_times_then_stays` |
 | Back-off arithmetic saturates instead of panicking on huge settings. | `backoff::huge_settings_saturate_instead_of_panicking` |
+| On shutdown the client closes an open connection with 1001 Going Away and does not wait for a CALL in flight. | `session::shutdown_closes_connection_and_returns`, `session::shutdown_during_boot_call_closes_connection`, `session::shutdown_during_heartbeat_call_closes_connection` |
+| Shutdown never waits for a back-off, the wait after Rejected or a connect timeout. | `session::shutdown_during_backoff_returns_at_once`, `session::shutdown_during_rejected_wait_returns_at_once`, `session::shutdown_during_connect_returns_at_once` |
+| `disconnect` never awaits a reader task that was already awaited to the end (that panics). | `session::disconnect_after_reader_was_awaited_does_not_panic` |
+| Shutdown ends within `close_timeout` even if the server never answers the Close. The timeout also covers sending the Close; a send that hangs on a full socket buffer is not tested, as a small Close frame always fits into the kernel buffer. | `session::shutdown_gives_up_after_close_timeout` |
+| Closing a connection that is already closing is not an error; a Close from the server gets a Close in reply (RFC 6455 section 5.5.1). | `client::second_close_is_ok`, `client::close_after_server_closed_is_ok` |
 | The client offers sub-protocol `ocpp1.6` in the handshake. | None yet: the fake CSMS answers `ocpp1.6` without looking at the request. Backlog. |
 | A malformed or non-`ws(s)://` URL stops the program at startup instead of being retried forever. | None yet: the check lives in `main`. Backlog. |
 

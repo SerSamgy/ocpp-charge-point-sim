@@ -10,7 +10,13 @@ use serde_json::json;
 use tokio::{net::TcpStream, sync::Mutex, task::JoinHandle, time::timeout};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{self, Message, client::IntoClientRequest, http::HeaderValue},
+    tungstenite::{
+        self, Message,
+        client::IntoClientRequest,
+        error::ProtocolError,
+        http::HeaderValue,
+        protocol::{CloseFrame, frame::coding::CloseCode},
+    },
 };
 use uuid::Uuid;
 
@@ -137,13 +143,32 @@ impl Client {
         }
     }
 
-    /// Starts the closing handshake: sends a Close frame. The reader task
-    /// finishes when the server answers with its own Close. We are done with
-    /// this connection, so waiting and later CALLs fail with `Disconnected`
-    /// right away.
-    pub async fn close(&self) -> Result<(), tungstenite::Error> {
+    /// Starts the closing handshake: sends a Close frame with `code`
+    /// (RFC 6455 section 7.4.1). The reader task finishes when the server
+    /// answers with its own Close. We are done with this connection, so
+    /// waiting and later CALLs fail with `Disconnected` right away.
+    ///
+    /// Closing a connection that is already closing is not an error.
+    pub async fn close(&self, code: CloseCode) -> Result<(), tungstenite::Error> {
         self.pending.close();
-        self.sink.lock().await.close().await
+        let mut sink = self.sink.lock().await;
+        let frame = CloseFrame {
+            code,
+            reason: "".into(),
+        };
+        // Unlike `sink.close()`, which sends a Close without a code, sending
+        // `Message::Close` fails once a Close went either way.
+        match sink.send(Message::Close(Some(frame))).await {
+            // The server closed first: tungstenite has queued our reply
+            // Close (RFC 6455 section 5.5.1 requires one), but sends it only
+            // on the next read, write or flush. The reader task stopped at
+            // the server's Close, so flush it here.
+            Err(tungstenite::Error::Protocol(ProtocolError::SendAfterClosing)) => {
+                sink.close().await
+            }
+            Err(tungstenite::Error::AlreadyClosed) => Ok(()),
+            other => other,
+        }
     }
 
     /// Serializes a frame, logs it as `>> ...` and writes it to the socket.
@@ -210,11 +235,13 @@ async fn read_loop(client: Arc<Client>, mut source: WsSource) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::echo_ocpp16;
     use crate::{
         ocpp16::{HeartbeatRequest, HeartbeatResponse},
         test_support::{Event, FakeCsms},
     };
     use tokio::{net::TcpListener, time::timeout};
+    use tokio_tungstenite::accept_hdr_async;
 
     const LONG: Duration = Duration::from_secs(5);
     const SHORT: Duration = Duration::from_millis(300);
@@ -409,7 +436,7 @@ mod tests {
             .await
             .expect("reader task did not stop")
             .expect("reader task panicked");
-        assert!(matches!(csms.recv_event().await, Event::Closed));
+        assert!(matches!(csms.recv_event().await, Event::Closed { .. }));
 
         let (_client, _reader) = Client::connect(&csms.url, timeouts(LONG)).await.unwrap();
         assert!(matches!(csms.recv_event().await, Event::Connected));
@@ -471,7 +498,7 @@ mod tests {
         let waiting = spawn_heartbeat(&client);
         csms.recv().await;
 
-        client.close().await.unwrap();
+        client.close(CloseCode::Normal).await.unwrap();
 
         let err = timeout(Duration::from_secs(1), waiting)
             .await
@@ -479,10 +506,62 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(matches!(err, CallFailure::Disconnected), "got {err:?}");
-        assert!(matches!(csms.recv_event().await, Event::Closed));
+        let closed = csms.recv_event().await;
+        assert!(
+            matches!(closed, Event::Closed { code: Some(1000) }),
+            "got {closed:?}"
+        );
         timeout(Duration::from_secs(1), reader)
             .await
             .expect("reader task did not stop")
             .expect("reader task panicked");
+    }
+
+    #[tokio::test]
+    async fn second_close_is_ok() {
+        let mut csms = FakeCsms::start().await;
+        let (client, _reader) = Client::connect(&csms.url, timeouts(LONG)).await.unwrap();
+        assert!(matches!(csms.recv_event().await, Event::Connected));
+
+        client.close(CloseCode::Normal).await.unwrap();
+        client.close(CloseCode::Away).await.unwrap();
+
+        // Only the first Close went out.
+        let closed = csms.recv_event().await;
+        assert!(
+            matches!(closed, Event::Closed { code: Some(1000) }),
+            "got {closed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_after_server_closed_is_ok() {
+        // A server that closes first and reports whether the client
+        // answered with a Close of its own.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/CP001", listener.local_addr().unwrap());
+        let (replied_tx, replied) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_hdr_async(tcp, echo_ocpp16).await.unwrap();
+            ws.close(None).await.unwrap();
+            let reply = ws.next().await;
+            let _ = replied_tx.send(matches!(reply, Some(Ok(Message::Close(_)))));
+        });
+        let (client, reader) = Client::connect(&url, timeouts(LONG)).await.unwrap();
+
+        // Once the reader has seen the server's Close, the connection is no
+        // longer active and sending a Close fails inside tungstenite.
+        timeout(Duration::from_secs(1), reader)
+            .await
+            .expect("reader task did not stop")
+            .expect("reader task panicked");
+        client.close(CloseCode::Away).await.unwrap();
+
+        let replied = timeout(Duration::from_secs(1), replied)
+            .await
+            .expect("server got no reply Close")
+            .unwrap();
+        assert!(replied, "server got something else than a reply Close");
     }
 }

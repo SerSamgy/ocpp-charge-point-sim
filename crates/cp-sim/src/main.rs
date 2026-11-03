@@ -1,5 +1,6 @@
 //! OCPP charge point simulator: connects to a CSMS over WebSocket, boots
-//! and keeps the connection alive. Speaks OCPP 1.6 today.
+//! and keeps the connection alive. Speaks OCPP 1.6 today. Ctrl+C or
+//! SIGTERM closes the connection and exits.
 //!
 //! Usage: `cp-sim [ws://host:port/<charge_point_id>]`, default
 //! `ws://localhost:9000/CP001`. The map of the modules and their
@@ -15,7 +16,7 @@ mod session;
 #[cfg(test)]
 mod test_support;
 
-use std::time::Duration;
+use std::{io, time::Duration};
 
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -36,6 +37,7 @@ const SETTINGS: Settings = Settings {
         repeat_times: 5,
     },
     boot_retry: boot::DEFAULT_BOOT_RETRY,
+    close_timeout: Duration::from_secs(5),
 };
 
 #[tokio::main]
@@ -50,13 +52,47 @@ async fn main() -> Result<(), client::BoxError> {
         return Err(format!("not a WebSocket URL: {url}").into());
     }
 
+    let shutdown = shutdown_signal()?;
     let request = BootNotificationRequest {
         charge_point_vendor: "Semyon".into(),
         charge_point_model: "cp-sim".into(),
         charge_point_serial_number: None,
         firmware_version: None,
     };
-    // `run` never returns: its result type has no values, so this match
-    // needs no arms and the compiler knows `main` cannot get past it.
-    match session::run(&url, SETTINGS, &request).await {}
+    session::run(&url, SETTINGS, &request, shutdown).await;
+    Ok(())
+}
+
+/// Completes on Ctrl+C (SIGINT) or SIGTERM, which is how systemd stops a
+/// service. The SIGTERM handler is installed here, before the program
+/// connects; failing to install it is a startup error.
+#[cfg(unix)]
+fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                if let Err(err) = result {
+                    eprintln!("cannot listen for Ctrl+C: {err}; only SIGTERM stops the program");
+                    terminate.recv().await;
+                }
+            }
+            _ = terminate.recv() => {}
+        }
+        println!("shutting down");
+    })
+}
+
+/// Completes on Ctrl+C; other platforms have no SIGTERM.
+#[cfg(not(unix))]
+fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
+    Ok(async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            eprintln!("cannot listen for Ctrl+C: {err}; the program runs until killed");
+            std::future::pending::<()>().await;
+        }
+        println!("shutting down");
+    })
 }
