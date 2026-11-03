@@ -58,7 +58,10 @@ or SIGTERM. `run` races it (`tokio::select!`) against connecting, serving
 the connection and the wait before a reconnect. During `serve` the signal
 cancels whatever is in flight, sends Close 1001 Going Away and waits for
 the server's Close at most `close_timeout`; elsewhere `run` returns at
-once. OCPP 1.6 and 2.0.1 define nothing for this, so the close codes come
+once. The close after Rejected is deliberately not raced against the
+signal: cancelling it half way would start a second wait for the
+shutdown close, so a signal during it lets it finish (at most
+`close_timeout`) and stops `run` in the wait that follows. OCPP 1.6 and 2.0.1 define nothing for this, so the close codes come
 from RFC 6455 section 7.4.1.
 
 ## Invariants
@@ -82,6 +85,7 @@ does not check that a test still means what the row says; review does.
 | Back-off arithmetic saturates instead of panicking on huge settings. | `backoff::huge_settings_saturate_instead_of_panicking` |
 | On shutdown the client closes an open connection with 1001 Going Away and does not wait for a CALL in flight. | `session::shutdown_closes_connection_and_returns`, `session::shutdown_during_boot_call_closes_connection`, `session::shutdown_during_heartbeat_call_closes_connection` |
 | Shutdown never waits for a back-off, the wait after Rejected or a connect timeout. | `session::shutdown_during_backoff_returns_at_once`, `session::shutdown_during_rejected_wait_returns_at_once`, `session::shutdown_during_connect_returns_at_once` |
+| `disconnect` never awaits a reader task that was already awaited to the end (that panics). | `session::disconnect_after_reader_was_awaited_does_not_panic` |
 | Shutdown ends within `close_timeout` even if the server never answers the Close. The timeout also covers sending the Close; a send that hangs on a full socket buffer is not tested, as a small Close frame always fits into the kernel buffer. | `session::shutdown_gives_up_after_close_timeout` |
 | Closing a connection that is already closing is not an error; a Close from the server gets a Close in reply (RFC 6455 section 5.5.1). | `client::second_close_is_ok`, `client::close_after_server_closed_is_ok` |
 | The client offers sub-protocol `ocpp1.6` in the handshake. | None yet: the fake CSMS answers `ocpp1.6` without looking at the request. Backlog. |
