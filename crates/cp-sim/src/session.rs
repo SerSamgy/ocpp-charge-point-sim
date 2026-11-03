@@ -1,7 +1,7 @@
 //! Staying connected to the CSMS: connect, BootNotification until Accepted,
 //! Heartbeat, and reconnect with back-off whenever the connection is lost.
 
-use std::{convert::Infallible, time::Duration};
+use std::time::Duration;
 
 use rand::rngs::StdRng;
 use tokio::{
@@ -24,16 +24,30 @@ pub struct Settings {
     /// Wait before the next BootNotification after one that failed
     /// (timeout, CALLERROR, malformed response) on a live connection.
     pub boot_retry: Duration,
+    /// How long to wait for the server to answer our Close frame before
+    /// dropping the connection.
+    pub close_timeout: Duration,
 }
 
-/// Runs the charge point forever; leaving the loop is step 3f (Ctrl+C).
+/// Runs the charge point until `shutdown` completes.
 /// - Connection failures and lost connections: reconnect after a back-off
 ///   wait (see `backoff`).
 /// - BootNotification until Accepted; after that, reconnects skip it, as
 ///   OCPP-J section 5.4 recommends (1.6 and 2.0.1 alike): our boot data
 ///   never changes while the program runs.
 /// - A failed CALL that leaves the connection up is logged and retried.
-pub async fn run(url: &str, settings: Settings, request: &BootNotificationRequest) -> Infallible {
+/// - On `shutdown`: close an open connection with 1001 Going Away (RFC 6455
+///   section 7.4.1) and return within `close_timeout`; a CALL in flight is
+///   not waited for. While connecting or waiting to reconnect, return at once.
+pub async fn run(
+    url: &str,
+    settings: Settings,
+    request: &BootNotificationRequest,
+    shutdown: impl Future<Output = ()>,
+) {
+    // `select!` polls `shutdown` by `&mut` in several places, and a future
+    // polled through a reference must not move: pin it once, here.
+    tokio::pin!(shutdown);
     let mut station = Station {
         settings,
         request,
@@ -44,10 +58,28 @@ pub async fn run(url: &str, settings: Settings, request: &BootNotificationReques
         rng: rand::make_rng(),
     };
     loop {
-        let wait = match Client::connect(url, settings.timeouts).await {
+        let connected = tokio::select! {
+            connected = Client::connect(url, settings.timeouts) => connected,
+            () = &mut shutdown => return,
+        };
+        let wait = match connected {
             Ok((client, mut reader)) => {
                 println!("connected to {url}");
-                match station.serve(&client, &mut reader).await {
+                // On shutdown the `serve` future is dropped wherever it waits,
+                // which cancels it. That is safe: a CALL in flight leaves an
+                // entry in `pending`, which `close` fails; a frame whose send
+                // had not reached tungstenite yet is never sent, one that had
+                // goes out before our Close.
+                let ended = tokio::select! {
+                    ended = station.serve(&client, &mut reader) => ended,
+                    () = &mut shutdown => {
+                        println!("closing the connection");
+                        disconnect(&client, &mut reader, settings.close_timeout, CloseCode::Away)
+                            .await;
+                        return;
+                    }
+                };
+                match ended {
                     Ended::Lost => {
                         // Usually finished already; if the socket broke only on
                         // the sending side, stop the reader so it does not linger.
@@ -56,10 +88,13 @@ pub async fn run(url: &str, settings: Settings, request: &BootNotificationReques
                     }
                     Ended::Rejected { after } => {
                         println!("boot rejected, reconnecting in {after:?}");
+                        // Not under `select!` with `shutdown`: a signal that
+                        // cancelled this close half way would leave a second
+                        // full `close_timeout` for the shutdown close.
                         disconnect(
                             &client,
                             &mut reader,
-                            settings.timeouts.call,
+                            settings.close_timeout,
                             CloseCode::Normal,
                         )
                         .await;
@@ -73,7 +108,10 @@ pub async fn run(url: &str, settings: Settings, request: &BootNotificationReques
             }
         };
         println!("reconnecting in {wait:?}");
-        sleep(wait).await;
+        tokio::select! {
+            () = sleep(wait) => {}
+            () = &mut shutdown => return,
+        }
     }
 }
 
@@ -176,8 +214,11 @@ impl Station<'_> {
     }
 }
 
-/// Closes the connection and waits up to `wait` for the reader task to finish;
+/// Closes the connection with `code` and waits for the reader task to finish;
 /// aborts it if the server does not complete the closing handshake.
+/// Everything, sending the Close included, takes at most `wait`: the send
+/// can hang too, on the `sink` lock held by the reader task or on a socket
+/// whose peer stopped reading.
 /// Returns true if the reader finished on its own.
 async fn disconnect(
     client: &Client,
@@ -185,10 +226,17 @@ async fn disconnect(
     wait: Duration,
     code: CloseCode,
 ) -> bool {
-    if let Err(err) = client.close(code).await {
-        eprintln!("failed to send Close: {err}");
-    }
-    if timeout(wait, &mut *reader).await.is_ok() {
+    let closing = async {
+        if let Err(err) = client.close(code).await {
+            eprintln!("failed to send Close: {err}");
+        }
+        // `boot` and `keep_alive` may have awaited the reader to the end
+        // already, and polling a finished `JoinHandle` again panics.
+        if !reader.is_finished() {
+            let _ = (&mut *reader).await;
+        }
+    };
+    if timeout(wait, closing).await.is_ok() {
         return true;
     }
     eprintln!("server did not finish the closing handshake, dropping the connection");
@@ -201,11 +249,17 @@ mod tests {
     use super::*;
     use crate::{
         frame::Frame,
-        test_support::{Event, FakeCsms},
+        test_support::{Event, FakeCsms, echo_ocpp16},
     };
+    use futures_util::StreamExt;
     use serde_json::json;
     use std::sync::Arc;
-    use tokio::{net::TcpListener, sync::mpsc, time::Instant};
+    use tokio::{
+        net::TcpListener,
+        sync::{mpsc, oneshot},
+        time::Instant,
+    };
+    use tokio_tungstenite::accept_hdr_async;
 
     const LONG: Duration = Duration::from_secs(5);
     const SHORT: Duration = Duration::from_millis(300);
@@ -226,6 +280,9 @@ mod tests {
                 repeat_times: 1,
             },
             boot_retry: MIN,
+            // Long, so a quick shutdown proves that the server answered our
+            // Close instead of `disconnect` giving up on it.
+            close_timeout: LONG,
         }
     }
 
@@ -240,9 +297,48 @@ mod tests {
 
     /// Runs the charge point in the background; the runtime stops it when
     /// the test ends.
-    fn spawn_run(url: &str, settings: Settings) -> JoinHandle<Infallible> {
+    fn spawn_run(url: &str, settings: Settings) -> JoinHandle<()> {
+        spawn_run_until(url, settings, std::future::pending())
+    }
+
+    fn spawn_run_until(
+        url: &str,
+        settings: Settings,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> JoinHandle<()> {
         let url = url.to_owned();
-        tokio::spawn(async move { run(&url, settings, &boot_request()).await })
+        tokio::spawn(async move { run(&url, settings, &boot_request(), shutdown).await })
+    }
+
+    /// A shutdown signal for `run`: send on the sender to stop. Dropping
+    /// the sender stops `run` too, so keep it until the signal is due.
+    fn shutdown_signal() -> (
+        oneshot::Sender<()>,
+        impl Future<Output = ()> + Send + 'static,
+    ) {
+        let (stop, rx) = oneshot::channel();
+        (stop, async move {
+            let _ = rx.await;
+        })
+    }
+
+    /// Waits for `run` to return; returns how long that took.
+    async fn time_to_stop(cp: JoinHandle<()>) -> Duration {
+        let started = Instant::now();
+        timeout(LONG + Duration::from_secs(1), cp)
+            .await
+            .expect("run did not stop")
+            .expect("run panicked");
+        started.elapsed()
+    }
+
+    /// Asserts that the next event is a Close from the client with `code`.
+    async fn assert_closed_with(csms: &mut FakeCsms, code: u16) {
+        let closed = csms.recv_event().await;
+        assert!(
+            matches!(closed, Event::Closed { code: Some(c) } if c == code),
+            "got {closed:?}"
+        );
     }
 
     /// Asserts that the event is a CALL of `action` and returns its ID.
@@ -503,6 +599,157 @@ mod tests {
 
         let id = call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
         csms.send(heartbeat_result(&id));
+    }
+
+    // --- Shutdown ---
+
+    #[tokio::test]
+    async fn shutdown_closes_connection_and_returns() {
+        let mut csms = FakeCsms::start().await;
+        let (stop, signal) = shutdown_signal();
+        let cp = spawn_run_until(&csms.url, settings(LONG), signal);
+        connect_and_accept(&mut csms).await;
+        let id = call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
+        csms.send(heartbeat_result(&id));
+
+        stop.send(()).unwrap();
+        let took = time_to_stop(cp).await;
+        assert!(took < Duration::from_secs(1), "took {took:?}");
+        assert_closed_with(&mut csms, 1001).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_boot_call_closes_connection() {
+        let mut csms = FakeCsms::start().await;
+        let (stop, signal) = shutdown_signal();
+        let cp = spawn_run_until(&csms.url, settings(LONG), signal);
+        assert!(matches!(csms.recv_event().await, Event::Connected));
+        call_id(csms.recv_event().await, "BootNotification"); // never answered
+
+        stop.send(()).unwrap();
+        let took = time_to_stop(cp).await;
+        assert!(
+            took < Duration::from_secs(1),
+            "waited for the call: {took:?}"
+        );
+        assert_closed_with(&mut csms, 1001).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_heartbeat_call_closes_connection() {
+        let mut csms = FakeCsms::start().await;
+        let (stop, signal) = shutdown_signal();
+        let cp = spawn_run_until(&csms.url, settings(LONG), signal);
+        connect_and_accept(&mut csms).await;
+        call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat"); // never answered
+
+        stop.send(()).unwrap();
+        let took = time_to_stop(cp).await;
+        assert!(
+            took < Duration::from_secs(1),
+            "waited for the call: {took:?}"
+        );
+        assert_closed_with(&mut csms, 1001).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_backoff_returns_at_once() {
+        // Accepts TCP and drops it at once, so every handshake fails.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/CP001", listener.local_addr().unwrap());
+        let (attempts_tx, mut attempts) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                drop(tcp);
+                let _ = attempts_tx.send(());
+            }
+        });
+        let mut settings = settings(LONG);
+        settings.backoff.wait_minimum = LONG;
+        let (stop, signal) = shutdown_signal();
+        let cp = spawn_run_until(&url, settings, signal);
+
+        timeout(LONG, attempts.recv()).await.unwrap().unwrap();
+        // Give the client time to see the dropped connection and start the
+        // back-off wait, so the signal arrives there and not in `connect`.
+        sleep(Duration::from_millis(200)).await;
+        stop.send(()).unwrap();
+        let took = time_to_stop(cp).await;
+        assert!(
+            took < Duration::from_secs(1),
+            "waited for the back-off: {took:?}"
+        );
+        assert!(attempts.try_recv().is_err(), "connected again");
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_rejected_wait_returns_at_once() {
+        let mut csms = FakeCsms::start().await;
+        let (stop, signal) = shutdown_signal();
+        let cp = spawn_run_until(&csms.url, settings(LONG), signal);
+        assert!(matches!(csms.recv_event().await, Event::Connected));
+        let id = call_id(csms.recv_event().await, "BootNotification");
+        // Longer than the 1 s bound below, shorter than `time_to_stop` waits.
+        csms.send(boot_result(&id, "Rejected", 5));
+        // Closed, so the client is in the wait after Rejected now.
+        assert_closed_with(&mut csms, 1000).await;
+
+        stop.send(()).unwrap();
+        let took = time_to_stop(cp).await;
+        assert!(
+            took < Duration::from_secs(1),
+            "waited after Rejected: {took:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_connect_returns_at_once() {
+        // Accepts TCP but never answers the WebSocket handshake.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/CP001", listener.local_addr().unwrap());
+        let (accepted_tx, accepted) = oneshot::channel();
+        tokio::spawn(async move {
+            let (_tcp, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let (stop, signal) = shutdown_signal();
+        let cp = spawn_run_until(&url, settings(LONG), signal);
+
+        timeout(LONG, accepted).await.unwrap().unwrap();
+        stop.send(()).unwrap();
+        let took = time_to_stop(cp).await;
+        assert!(
+            took < Duration::from_secs(1),
+            "waited for the handshake: {took:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_gives_up_after_close_timeout() {
+        // Completes the handshake, reads the BootNotification and then never
+        // reads again, so our Close is never answered.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/CP001", listener.local_addr().unwrap());
+        let (booted_tx, booted) = oneshot::channel();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = accept_hdr_async(tcp, echo_ocpp16).await.unwrap();
+            ws.next().await;
+            let _ = booted_tx.send(());
+            std::future::pending::<()>().await;
+            drop(ws); // keeps the socket open until here
+        });
+        let mut settings = settings(LONG);
+        settings.close_timeout = SHORT;
+        let (stop, signal) = shutdown_signal();
+        let cp = spawn_run_until(&url, settings, signal);
+
+        timeout(LONG, booted).await.unwrap().unwrap();
+        stop.send(()).unwrap();
+        let took = time_to_stop(cp).await;
+        assert!(took >= SHORT, "did not wait for the server: {took:?}");
+        assert!(took < LONG, "ignored close_timeout: {took:?}");
     }
 
     #[tokio::test]

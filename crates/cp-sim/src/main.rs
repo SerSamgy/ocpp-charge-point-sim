@@ -36,6 +36,7 @@ const SETTINGS: Settings = Settings {
         repeat_times: 5,
     },
     boot_retry: boot::DEFAULT_BOOT_RETRY,
+    close_timeout: Duration::from_secs(5),
 };
 
 #[tokio::main]
@@ -56,7 +57,7 @@ async fn main() -> Result<(), client::BoxError> {
         charge_point_serial_number: None,
         firmware_version: None,
     };
-    // `run` never returns: its result type has no values, so this match
-    // needs no arms and the compiler knows `main` cannot get past it.
-    match session::run(&url, SETTINGS, &request).await {}
+    // No shutdown signal yet: runs until the process is killed.
+    session::run(&url, SETTINGS, &request, std::future::pending()).await;
+    Ok(())
 }
