@@ -753,6 +753,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disconnect_after_reader_was_awaited_does_not_panic() {
+        let mut csms = FakeCsms::start().await;
+        let (client, mut reader) = Client::connect(&csms.url, settings(LONG).timeouts)
+            .await
+            .unwrap();
+        assert!(matches!(csms.recv_event().await, Event::Connected));
+        csms.close_connection();
+        // What `boot` and `keep_alive` do: await the reader to the end
+        // through `&mut`, so the handle is already consumed.
+        timeout(Duration::from_secs(1), &mut reader)
+            .await
+            .expect("reader task did not stop")
+            .expect("reader task panicked");
+
+        // Awaiting it again would panic: "JoinHandle polled after completion".
+        assert!(disconnect(&client, &mut reader, LONG, CloseCode::Away).await);
+    }
+
+    #[tokio::test]
     async fn disconnect_finishes_reader_and_fails_calls_on_old_client() {
         let mut csms = FakeCsms::start().await;
         let (client, mut reader) = Client::connect(&csms.url, settings(LONG).timeouts)
