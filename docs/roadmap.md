@@ -36,8 +36,9 @@ instead.
          Going Away, bounded by a close timeout.
          [#10](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/10)
 4. **In progress.** Connector state machine: Available → Preparing →
-   Charging → Finishing → Available, plus Faulted. StatusNotification on every transition.
-   Events come from the keyboard for now. Split into two pull requests.
+   Charging → Finishing → Available, plus Faulted. StatusNotification on
+   every transition. Events come from the keyboard for now. Split into
+   two pull requests.
    - [x] **4a.** The state machine (`connector`), the 1.6
          StatusNotification payloads, the mapping from state to message
          (`status16`) and the CSMS handler. Nothing calls them yet.
