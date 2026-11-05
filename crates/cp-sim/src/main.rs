@@ -9,6 +9,8 @@
 mod backoff;
 mod boot;
 mod client;
+#[cfg_attr(not(test), expect(dead_code, reason = "wired into session in step 4b"))]
+mod connector;
 mod frame;
 mod ocpp16;
 mod pending;
