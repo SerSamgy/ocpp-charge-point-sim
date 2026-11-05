@@ -12,6 +12,8 @@ mod client;
 #[cfg_attr(not(test), expect(dead_code, reason = "wired into session in step 4b"))]
 mod connector;
 mod frame;
+#[cfg_attr(not(test), expect(dead_code, reason = "wired into main in step 4b-2"))]
+mod keyboard;
 mod ocpp16;
 mod pending;
 mod session;
