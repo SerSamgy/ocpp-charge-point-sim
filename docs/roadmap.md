@@ -119,7 +119,7 @@ Found during the migration inventory; carried over as is
       queued reply only on the next read, write or flush, so the server
       sees an abnormal closure (1006). `Client::close` already flushes it
       on shutdown and after Rejected (step 3f).
-- [ ] `read_loop` logs every received Close as "server closed
+- [ ] `read_loop` logs every received Close as "server closed the
       connection", also when it is the server's reply to our own Close.
 - [x] After a reconnect without BootNotification, send StatusNotification
       for every connector again. Done in step 4b-1,
@@ -178,7 +178,11 @@ Found during the migration inventory; carried over as is
       debounce) with the experiments as examples.
 - [ ] Validate serialized messages against the official JSON schemas in
       tests.
-- [ ] Structured logging with `tracing` instead of `println!`.
+- [x] Structured logging with `tracing` instead of `println!`. Done in
+      `cp-sim`, see `docs/architecture.md` (Logging).
+- [ ] Logging follow-ups: a span with the charge point ID around the
+      session, a JSON output format for journald and log collectors on the
+      Pi, `tracing` instead of `println!` in `cp-blink`.
 - [ ] Fix the test name typo `cpms` in `boot_response_parses_cpms_response`.
 - [ ] `csms`: write the README and the `pyproject.toml` description.
 - [ ] Configurable port for end-to-end checks: `csms/main.py` hard-codes

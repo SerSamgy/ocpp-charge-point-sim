@@ -32,6 +32,22 @@ Local only, gitignored: `docs/specs/` (OCPP specifications, errata and
 JSON schemas, not redistributable; layout in `CLAUDE.md`) and
 `.claude/settings.local.json` (personal agent overrides).
 
+## Logs
+
+`cp-sim` writes its log to stderr, so keep it with `2>`, not `>`. The level
+filter is `RUST_LOG`; without it the program logs its own events down to
+`debug`, which includes every frame:
+
+```sh
+RUST_LOG=cp_sim=info cargo run -p cp-sim   # connection and connector events only
+RUST_LOG=warn cargo run -p cp-sim              # only what went wrong
+```
+
+A blank `RUST_LOG` means the default; a value that does not parse stops the
+program at startup. The filter covers the events of `cp_sim`:
+`tokio-tungstenite` logs through the `log` crate, which is not bridged to
+`tracing`, so `RUST_LOG=tungstenite=debug` shows nothing.
+
 ## Building for the Pi
 
 `just build-pi` cross-compiles static release binaries for
