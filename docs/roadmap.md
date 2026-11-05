@@ -124,8 +124,9 @@ Found during the migration inventory; carried over as is
 - [ ] After a reconnect without BootNotification, send StatusNotification
       for every connector again (step 4b).
 - [x] StatusNotification `timestamp`: whole seconds in UTC from the
-      `time` crate (`timestamp`, `status16`). Done after step 4a; the
-      caller passes the instant in step 4b.
+      `time` crate (`timestamp`, `status16`). Done after step 4a,
+      [#12](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/12);
+      the caller passes the instant in step 4b.
 - [ ] Trust in `timestamp`: it comes from the system clock, which on a Pi
       without an RTC battery can be wrong until NTP has synchronised, and
       the CSMS believes it. Sync with `currentTime` of
