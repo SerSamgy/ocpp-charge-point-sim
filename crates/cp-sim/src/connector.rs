@@ -15,6 +15,10 @@
 //!   1.6 table, but no event produces them yet. After Finishing with the
 //!   cable still plugged in, only `Unplug` works.
 
+use std::num::NonZeroU32;
+
+use time::UtcDateTime;
+
 /// Why a connector is faulted. Each cause has one OCPP error code; the
 /// warning-only `EVCommunicationError` is deliberately not here, because
 /// section 4.9 forbids it together with the status Faulted.
@@ -79,6 +83,28 @@ pub enum Event {
 pub struct InvalidEvent {
     pub state: State,
     pub event: Event,
+}
+
+/// One connector as the station keeps it: its number, its state and the
+/// instant the state was reached (OCPP 1.6 section 6.47: the `timestamp` of
+/// a StatusNotification is the time for which the status is reported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Connector {
+    pub id: NonZeroU32,
+    pub state: State,
+    pub since: UtcDateTime,
+}
+
+impl Connector {
+    /// A connector that is Available since `since`. The instant is passed
+    /// in, not read from a clock, so this module stays free of I/O.
+    pub fn new(id: NonZeroU32, since: UtcDateTime) -> Self {
+        Connector {
+            id,
+            state: State::Available,
+            since,
+        }
+    }
 }
 
 impl State {
@@ -342,5 +368,19 @@ mod tests {
             }
         }
         assert_eq!(transitions, valid_edges().len());
+    }
+
+    #[test]
+    fn a_new_connector_is_available_since_the_given_instant() {
+        let id = NonZeroU32::new(1).unwrap();
+        let since = UtcDateTime::from_unix_timestamp(1_793_880_000).unwrap();
+        assert_eq!(
+            Connector::new(id, since),
+            Connector {
+                id,
+                state: State::Available,
+                since
+            }
+        );
     }
 }

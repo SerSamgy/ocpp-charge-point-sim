@@ -15,15 +15,14 @@ mod frame;
 mod ocpp16;
 mod pending;
 mod session;
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into session in step 4b"))]
 mod status16;
 #[cfg(test)]
 mod test_support;
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into session in step 4b"))]
 mod timestamp;
 
 use std::{io, time::Duration};
 
+use time::UtcDateTime;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::{
@@ -65,7 +64,7 @@ async fn main() -> Result<(), client::BoxError> {
         charge_point_serial_number: None,
         firmware_version: None,
     };
-    session::run(&url, SETTINGS, &request, shutdown).await;
+    session::run(&url, SETTINGS, &request, UtcDateTime::now(), shutdown).await;
     Ok(())
 }
 

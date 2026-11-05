@@ -9,19 +9,47 @@ use std::num::NonZeroU32;
 use time::UtcDateTime;
 
 use crate::{
-    connector::{Fault, State},
+    connector::{Connector, Fault, State},
     ocpp16::{ChargePointErrorCode, ChargePointStatus, StatusNotificationRequest},
     timestamp,
 };
 
+/// What the station reports after BootNotification was accepted and after a
+/// reconnect (errata 3.22): connector 0, the charge point as a whole, then
+/// every connector with its current status. In that order; the caller sends
+/// them one after the other.
+///
+/// Connector 0 may only be Available, Unavailable or Faulted, and the
+/// station models only Available, so it is built by a helper that takes no
+/// state; `started` is the time that status was reached.
+pub fn report(started: UtcDateTime, connectors: &[Connector]) -> Vec<StatusNotificationRequest> {
+    let mut requests = vec![charge_point_status(started)];
+    requests.extend(
+        connectors
+            .iter()
+            .map(|c| status_notification(c.id, c.state, c.since)),
+    );
+    requests
+}
+
+fn charge_point_status(at: UtcDateTime) -> StatusNotificationRequest {
+    StatusNotificationRequest {
+        connector_id: 0,
+        error_code: ChargePointErrorCode::NoError,
+        info: None,
+        status: ChargePointStatus::Available,
+        timestamp: timestamp::rfc3339(at),
+        vendor_id: None,
+        vendor_error_code: None,
+    }
+}
+
 /// The report for connector `connector_id` in `state`, reached at `at`.
 ///
 /// The clock is a parameter, not read here, so the function stays pure.
-/// Which instant to pass is up to the caller (step 4b).
 ///
 /// Connector 0 (the charge point as a whole) is not representable here:
-/// it may only be Available, Unavailable or Faulted, so it gets its own
-/// function when it is needed (step 4b).
+/// `report` builds it.
 pub fn status_notification(
     connector_id: NonZeroU32,
     state: State,
@@ -152,6 +180,73 @@ mod tests {
         let at = UtcDateTime::from_unix_timestamp(1_793_880_000).unwrap();
         let req = status_notification(ONE, State::Preparing, at);
         assert_eq!(req.timestamp.as_deref(), Some("2026-11-05T12:00:00Z"));
+    }
+
+    fn instant(unix: i64) -> UtcDateTime {
+        UtcDateTime::from_unix_timestamp(unix).unwrap()
+    }
+
+    #[test]
+    fn report_starts_with_connector_0_available_since_the_start() {
+        let started = instant(1_793_880_000);
+        let reports = report(started, &[]);
+        assert_eq!(reports.len(), 1);
+        let zero = &reports[0];
+        assert_eq!(zero.connector_id, 0);
+        assert_eq!(zero.status, ChargePointStatus::Available);
+        assert_eq!(zero.error_code, ChargePointErrorCode::NoError);
+        assert_eq!(zero.timestamp.as_deref(), Some("2026-11-05T12:00:00Z"));
+    }
+
+    #[test]
+    fn report_lists_each_connector_with_its_own_state_and_instant() {
+        let started = instant(1_793_880_000);
+        let one = Connector {
+            id: NonZeroU32::new(1).unwrap(),
+            state: State::Charging,
+            since: instant(1_793_880_060),
+        };
+        let two = Connector {
+            id: NonZeroU32::new(2).unwrap(),
+            state: State::Available,
+            since: started,
+        };
+        let reports = report(started, &[one, two]);
+        let summary: Vec<_> = reports
+            .iter()
+            .map(|r| (r.connector_id, r.status, r.timestamp.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (
+                    0,
+                    ChargePointStatus::Available,
+                    Some("2026-11-05T12:00:00Z")
+                ),
+                (1, ChargePointStatus::Charging, Some("2026-11-05T12:01:00Z")),
+                (
+                    2,
+                    ChargePointStatus::Available,
+                    Some("2026-11-05T12:00:00Z")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn report_keeps_the_error_code_of_a_faulted_connector() {
+        let faulted = Connector {
+            id: ONE,
+            state: State::Faulted {
+                fault: Fault::GroundFailure,
+                resume: Resume::Charging,
+            },
+            since: AT,
+        };
+        let reports = report(AT, &[faulted]);
+        assert_eq!(reports[1].status, ChargePointStatus::Faulted);
+        assert_eq!(reports[1].error_code, ChargePointErrorCode::GroundFailure);
     }
 
     #[test]

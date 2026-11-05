@@ -43,18 +43,20 @@ instead.
          StatusNotification payloads, the mapping from state to message
          (`status16`) and the CSMS handler. Nothing calls them yet.
          [#11](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/11)
-   - [ ] **4b.** Keyboard events from stdin, wiring into `session`,
-         StatusNotification on every transition. Decide which instant
-         the caller passes to `status16`: the time of the last transition
-         stored with the connector state (1.6 section 4.9: a status that
-         changed while offline), or the current time for a report after
-         `Accepted` (errata 3.22). Connector 0 needs its
-         own function (it may only be Available, Unavailable or Faulted;
-         `status16` cannot build it). After `Accepted` and after a
-         reconnect without BootNotification, report connector 0 and every
-         connector (errata 3.22). Removes the `dead_code` expectations on
-         `connector`, `status16` and the StatusNotification items of
-         `ocpp16`.
+   - [ ] **4b.** Split into two pull requests.
+     - [x] **4b-1.** The station keeps a record per connector and reports
+           connector 0 and connector 1 (always Available so far) after
+           every `Accepted` and after every reconnect without
+           BootNotification (errata 3.22). Each report carries the instant
+           the status was reached. First check of StatusNotification
+           from the Rust client against `just csms`.
+           [#14](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/14)
+     - [ ] **4b-2.** Keyboard events (`plug`, `start`, `stop`, `unplug`,
+           `fault <kind>`, `clear`) from stdin on a thread of its own,
+           stamped with the time of the key press; StatusNotification on
+           every transition of a live connection; events that happen
+           while offline are applied after the reconnect and reported
+           once. Removes the last `dead_code` expectation (`connector`).
 5. **Not started.** Transactions: Authorize, StartTransaction,
    StopTransaction, MeterValues with a simulated energy meter.
 
@@ -121,8 +123,12 @@ Found during the migration inventory; carried over as is
       on shutdown and after Rejected (step 3f).
 - [ ] `read_loop` logs every received Close as "server closed
       connection", also when it is the server's reply to our own Close.
-- [ ] After a reconnect without BootNotification, send StatusNotification
-      for every connector again (step 4b).
+- [x] After a reconnect without BootNotification, send StatusNotification
+      for every connector again. Done in step 4b-1,
+      [#14](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/14).
+- [ ] Retry a StatusNotification that failed on a live connection
+      (timeout, CALLERROR): today it is logged and the CSMS may stay out
+      of date until the next reconnect re-reports everything.
 - [x] StatusNotification `timestamp`: whole seconds in UTC from the
       `time` crate (`timestamp`, `status16`). Done after step 4a,
       [#12](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/12);
@@ -131,6 +137,10 @@ Found during the migration inventory; carried over as is
       without an RTC battery can be wrong until NTP has synchronised, and
       the CSMS believes it. Sync with `currentTime` of
       BootNotification/Heartbeat (1.6 section 4.2) or check NTP at deploy.
+      The program start and the time of every status reached are fixed
+      once, so a Pi that starts before NTP has synchronised (autostart,
+      step 10) reports a wrong time for the untouched initial state on
+      every report until the program restarts.
 - [ ] StatusNotification `info` for an EV-side disconnect (`EV side
       disconnected`, 1.6 section 4.9, `StopTransactionOnEVSideDisconnect`):
       needs a reason in the Finishing state; today Unplug while Charging
