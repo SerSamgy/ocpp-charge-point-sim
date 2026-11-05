@@ -42,6 +42,7 @@ instead.
    - [x] **4a.** The state machine (`connector`), the 1.6
          StatusNotification payloads, the mapping from state to message
          (`status16`) and the CSMS handler. Nothing calls them yet.
+         [#11](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/11)
    - [ ] **4b.** Keyboard events from stdin, wiring into `session`,
          StatusNotification on every transition. Connector 0 needs its
          own function (it may only be Available, Unavailable or Faulted;
