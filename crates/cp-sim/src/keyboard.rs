@@ -19,6 +19,7 @@ use std::{
 
 use time::UtcDateTime;
 use tokio::sync::mpsc;
+use tracing::warn;
 
 use crate::connector::{Event, Fault};
 
@@ -63,6 +64,10 @@ impl fmt::Display for ParseError {
 /// the program would hang until the user pressed Enter. A plain thread that
 /// is never joined dies with the process. The thread ends at end of file, on
 /// a read error, or when the session has dropped the receiver.
+#[expect(
+    clippy::print_stderr,
+    reason = "replies to what the owner types, not log events: a log filter must not hide them"
+)]
 pub fn spawn(inputs: mpsc::Sender<Input>) -> io::Result<()> {
     thread::Builder::new()
         .name("keyboard".into())
@@ -72,7 +77,7 @@ pub fn spawn(inputs: mpsc::Sender<Input>) -> io::Result<()> {
                 eprintln!("{HELP}");
             }
             read_inputs(stdin.lock(), &inputs, UtcDateTime::now);
-            eprintln!("keyboard input ended; the station keeps running without it");
+            warn!("keyboard input ended; the station keeps running without it");
         })?;
     Ok(())
 }
@@ -84,6 +89,10 @@ pub fn spawn(inputs: mpsc::Sender<Input>) -> io::Result<()> {
 /// a failing input would fail again at once. `blocking_send` waits when the
 /// channel is full. Returns at end of file, on a read error, or when the
 /// receiver is gone.
+#[expect(
+    clippy::print_stderr,
+    reason = "replies to what the owner types, not log events: a log filter must not hide them"
+)]
 fn read_inputs(
     mut reader: impl BufRead,
     inputs: &mpsc::Sender<Input>,
@@ -100,7 +109,7 @@ fn read_inputs(
                 continue;
             }
             Err(err) => {
-                eprintln!("cannot read the keyboard: {err}");
+                warn!(%err, "cannot read the keyboard");
                 return;
             }
         }

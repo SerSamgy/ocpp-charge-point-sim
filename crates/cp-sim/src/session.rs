@@ -15,6 +15,7 @@ use tokio::{
     time::{MissedTickBehavior, interval, sleep, timeout},
 };
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tracing::{info, warn};
 
 use crate::{
     backoff::{Backoff, BackoffConfig},
@@ -95,7 +96,7 @@ pub async fn run(
         };
         let wait = match connected {
             Ok((client, mut reader)) => {
-                println!("connected to {url}");
+                info!(%url, "connected");
                 // On shutdown the `serve` future is dropped wherever it waits,
                 // which cancels it. That is safe: a CALL in flight leaves an
                 // entry in `pending`, which `close` fails; a frame whose send
@@ -104,7 +105,7 @@ pub async fn run(
                 let ended = tokio::select! {
                     ended = station.serve(&client, &mut reader) => ended,
                     () = &mut shutdown => {
-                        println!("closing the connection");
+                        info!("closing the connection");
                         disconnect(&client, &mut reader, settings.close_timeout, CloseCode::Away)
                             .await;
                         return;
@@ -118,7 +119,7 @@ pub async fn run(
                         station.backoff.next_delay(&mut station.rng)
                     }
                     Ended::Rejected { after } => {
-                        println!("boot rejected, reconnecting in {after:?}");
+                        info!(?after, "boot rejected, reconnecting later");
                         // Not under `select!` with `shutdown`: a signal that
                         // cancelled this close half way would leave a second
                         // full `close_timeout` for the shutdown close.
@@ -134,11 +135,11 @@ pub async fn run(
                 }
             }
             Err(err) => {
-                eprintln!("cannot connect to {url}: {err}");
+                warn!(%url, %err, "cannot connect");
                 station.backoff.next_delay(&mut station.rng)
             }
         };
-        println!("reconnecting in {wait:?}");
+        info!(?wait, "reconnecting");
         tokio::select! {
             () = sleep(wait) => {}
             () = &mut shutdown => return,
@@ -192,7 +193,7 @@ impl Station<'_> {
             Some(every) => self.keep_alive(client, reader, every).await,
             None => match self.boot(client, reader).await {
                 Ok(every) => {
-                    println!("accepted, heartbeat every {every:?}");
+                    info!(heartbeat = ?every, "boot accepted");
                     self.heartbeat = Some(every);
                     self.keep_alive(client, reader, every).await
                 }
@@ -216,7 +217,7 @@ impl Station<'_> {
                     match boot::next_step(&response) {
                         BootStep::Accepted { heartbeat } => return Ok(heartbeat),
                         BootStep::RetryOnSameConnection { after } => {
-                            println!("boot pending, next attempt in {after:?}");
+                            info!(?after, "boot pending, next attempt later");
                             after
                         }
                         BootStep::Reconnect { after } => return Err(Ended::Rejected { after }),
@@ -225,7 +226,7 @@ impl Station<'_> {
                 Err(CallFailure::Disconnected) => return Err(Ended::Lost),
                 Err(err) => {
                     let after = self.settings.boot_retry;
-                    eprintln!("BootNotification failed: {err}; next attempt in {after:?}");
+                    warn!(%err, ?after, "BootNotification failed, next attempt later");
                     after
                 }
             };
@@ -266,7 +267,7 @@ impl Station<'_> {
                 _ = ticker.tick() => match client.call(&HeartbeatRequest {}).await {
                     Ok(_) => self.backoff.reset(),
                     Err(CallFailure::Disconnected) => return Ended::Lost,
-                    Err(err) => eprintln!("Heartbeat failed: {err}"),
+                    Err(err) => warn!(%err, "Heartbeat failed"),
                 },
                 // `select!` drops the other futures before it runs a handler,
                 // so the handler may use `self` again.
@@ -306,9 +307,10 @@ impl Station<'_> {
         match client.call(request).await {
             Ok(_) => self.backoff.reset(),
             Err(CallFailure::Disconnected) => return Err(Ended::Lost),
-            Err(err) => eprintln!(
-                "StatusNotification for connector {} failed: {err}",
-                request.connector_id
+            Err(err) => warn!(
+                connector = request.connector_id,
+                %err,
+                "StatusNotification failed"
             ),
         }
         Ok(())
@@ -332,13 +334,19 @@ impl Station<'_> {
     /// is stamped with the instant of the input and the request to report it
     /// is returned. An event that does not fit the state is printed and
     /// changes nothing.
+    #[expect(
+        clippy::print_stderr,
+        reason = "replies to what the owner types, not log events: a log filter must not hide them"
+    )]
     fn apply(&mut self, input: Input) -> Option<StatusNotificationRequest> {
         let connector = self.connectors.first_mut()?;
         match connector.state.on(input.event) {
             Ok(state) => {
-                println!(
-                    "connector {}: {:?} -> {:?}",
-                    connector.id, connector.state, state
+                info!(
+                    connector = connector.id,
+                    from = ?connector.state,
+                    to = ?state,
+                    "connector state changed"
                 );
                 connector.state = state;
                 connector.since = input.at;
@@ -369,7 +377,7 @@ async fn disconnect(
 ) -> bool {
     let closing = async {
         if let Err(err) = client.close(code).await {
-            eprintln!("failed to send Close: {err}");
+            warn!(%err, "failed to send Close");
         }
         // `boot` and `keep_alive` may have awaited the reader to the end
         // already, and polling a finished `JoinHandle` again panics.
@@ -380,7 +388,7 @@ async fn disconnect(
     if timeout(wait, closing).await.is_ok() {
         return true;
     }
-    eprintln!("server did not finish the closing handshake, dropping the connection");
+    warn!("server did not finish the closing handshake, dropping the connection");
     reader.abort();
     false
 }
@@ -392,7 +400,7 @@ mod tests {
         connector::{Event as ConnectorEvent, Fault},
         frame::Frame,
         keyboard::Input,
-        test_support::{Event, FakeCsms, echo_ocpp16},
+        test_support::{Event, FakeCsms, LogCapture, echo_ocpp16},
     };
     use futures_util::StreamExt;
     use serde_json::json;
@@ -403,6 +411,7 @@ mod tests {
         time::Instant,
     };
     use tokio_tungstenite::accept_hdr_async;
+    use tracing_subscriber::EnvFilter;
 
     const LONG: Duration = Duration::from_secs(5);
     const SHORT: Duration = Duration::from_millis(300);
@@ -946,6 +955,28 @@ mod tests {
         // The time of the input, not the time of the report.
         let preparing = report_at(1, "Preparing", "NoError", "2026-11-05T12:00:00Z");
         expect_report(&mut csms, preparing).await;
+    }
+
+    #[tokio::test]
+    async fn state_change_is_logged_with_its_fields() {
+        let logs = LogCapture::start(EnvFilter::new("cp_sim=info"));
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+
+        inputs
+            .send(input(ConnectorEvent::PlugIn, T0))
+            .await
+            .unwrap();
+        let preparing = report_at(1, "Preparing", "NoError", "2026-11-05T12:00:00Z");
+        expect_report(&mut csms, preparing).await;
+
+        let text = logs.text();
+        let line = text.lines().find(|l| l.contains("connector state changed"));
+        let line = line.unwrap_or_else(|| panic!("no state change in the log:\n{text}"));
+        for field in ["connector=1", "from=Available", "to=Preparing"] {
+            assert!(line.contains(field), "{field} missing in: {line}");
+        }
     }
 
     #[tokio::test]

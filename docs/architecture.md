@@ -30,8 +30,34 @@ Layered from the wire up; each module uses only the ones above it.
 | `status16` | Maps a connector state and the instant it was reached to a 1.6 StatusNotification request; `report` builds the list sent after Accepted and after a reconnect (errata 3.22): connector 0, then every connector. Connector 0 is not representable by `status_notification`. | Yes, through `connector` and `ocpp16`. |
 | `backoff` | Wait before a reconnect, OCPP-J 2.0.1 part 4 section 5.4. | No, a transport rule. |
 | `session` | Stays connected until a shutdown signal: connect, boot until Accepted, report the status of connector 0 and the connector, apply keyboard events and report each one, Heartbeat, reconnect; on the signal, close the connection and return. Owns the state that survives a connection (`Station`). | Yes, through `boot` and `ocpp16`. |
-| `main` | Reads the CSMS URL, rejects a malformed one, fixes the settings, creates the input channel and starts the keyboard thread (`keyboard::spawn`), runs `session::run` until Ctrl+C or SIGTERM. | Boot payload is 1.6. |
-| `test_support` | Tests only: `FakeCsms`, a WebSocket server driven by the test. | 1.6 sub-protocol. |
+| `logging` | Installs the global `tracing` subscriber: events to stderr, filter from `RUST_LOG`, default `cp_sim=debug`; a malformed `RUST_LOG` is a startup error. Called first in `main`. | No. |
+| `main` | Starts logging, reads the CSMS URL, rejects a malformed one, fixes the settings, creates the input channel and starts the keyboard thread (`keyboard::spawn`), runs `session::run` until Ctrl+C or SIGTERM. | Boot payload is 1.6. |
+| `test_support` | Tests only: `FakeCsms`, a WebSocket server driven by the test; `LogCapture`, which collects the log events of the test's thread as text. | 1.6 sub-protocol. |
+
+## Logging
+
+The program logs through `tracing`, never `println!`: `clippy::print_stdout`
+and `clippy::print_stderr` are denied for the crate. Every event is a level,
+a message and fields (`connector = 1, from = Available, to = Preparing`),
+not a pre-formatted string.
+
+- `debug`: every frame on the wire, with `direction = "out"` or `"in"` and
+  the frame text.
+- `info`: the life of the connection and of the connector (connected, boot
+  accepted, reconnecting, a connector changed state, shutting down).
+- `warn`: a failure that the program survives (a CALL that failed, a
+  malformed frame, no connection).
+
+The replies to what the owner types on the keyboard are not log events and
+stay `eprintln!` (`#[expect]` says so at each place), so a filter such as
+`RUST_LOG=error` cannot hide them: help, an unknown command, a line that is
+not UTF-8, and an event that does not fit the connector state.
+
+Tests: `test_support::LogCapture` collects the events of the current thread.
+It works through one global forwarding subscriber because `tracing` caches
+per call site whether anybody listens, and tests run in parallel. A test
+that reads the log must run on a `current_thread` runtime (the
+`#[tokio::test]` default).
 
 ## Message flow
 
@@ -47,7 +73,7 @@ Outgoing CALL, for example Heartbeat:
 
 Incoming CALL from the CSMS: `pending` does not claim it, so `read_loop`
 answers with CALLERROR `NotImplemented`. Malformed or unexpected frames
-are logged and skipped.
+are logged (`warn`) and skipped.
 
 Status reports: after Accepted and after every reconnect that skips the
 boot, `session` sends the list from `status16::report` (connector 0, then
@@ -109,6 +135,9 @@ does not check that a test still means what the row says; review does.
 | A failed CALL (timeout, CALLERROR) on a live connection does not end the connection or the program. | `session::failed_boot_is_retried_on_same_connection`, `session::heartbeat_call_error_keeps_connection`, `session::heartbeat_timeout_keeps_connection`, `session::report_call_error_keeps_connection`, `session::report_timeout_keeps_connection` |
 | Back-off grows while connecting fails and resets only after a successful OCPP exchange, not after a bare handshake. | `session::backoff_grows_while_connect_fails`, `session::handshake_alone_does_not_reset_backoff`, `session::successful_exchange_resets_backoff`, `session::successful_report_resets_backoff`, `backoff::doubles_up_to_repeat_times_then_stays` |
 | Back-off arithmetic saturates instead of panicking on huge settings. | `backoff::huge_settings_saturate_instead_of_panicking` |
+| Every frame on the wire is logged at `debug` with its direction (`out` or `in`) and text. | `client::frames_are_logged_with_their_direction` |
+| A connector state change is logged at `info` with the connector, the old and the new state as fields. | `session::state_change_is_logged_with_its_fields` |
+| `RUST_LOG` overrides the default filter; blank means the default; a malformed value stops the program at startup and names the value. | `logging::default_filter_logs_debug_of_this_crate`, `logging::blank_value_means_the_default`, `logging::rust_log_overrides_the_default`, `logging::malformed_directives_are_an_error` |
 | On shutdown the client closes an open connection with 1001 Going Away and does not wait for a CALL in flight. | `session::shutdown_closes_connection_and_returns`, `session::shutdown_during_boot_call_closes_connection`, `session::shutdown_during_heartbeat_call_closes_connection`, `session::shutdown_during_report_closes_connection`, `session::shutdown_during_status_notification_closes_connection` |
 | A keyboard event is applied only after Accepted. On a live connection a valid event sends one StatusNotification carrying the instant the event was typed; an event that does not fit sends nothing and changes nothing; events that waited are applied in order and reported once, with the instant of the last one. | `session::input_sends_status_notification`, `session::invalid_event_sends_nothing`, `session::fault_reports_the_error_code_and_clear_returns_to_the_pre_fault_state`, `session::inputs_wait_until_boot_is_accepted`, `session::inputs_while_offline_are_reported_once_with_the_time_of_the_last_one`, `session::connection_lost_during_an_input_report_reports_the_new_state_again` |
 | The end of the keyboard input does not stop the station or make it spin. | `session::heartbeats_continue_after_the_sender_is_dropped` |
