@@ -179,7 +179,8 @@ Found during the migration inventory; carried over as is
 - [ ] Validate serialized messages against the official JSON schemas in
       tests.
 - [x] Structured logging with `tracing` instead of `println!`. Done in
-      `cp-sim`, see `docs/architecture.md` (Logging).
+      `cp-sim`, see `docs/architecture.md` (Logging),
+      [#16](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/16).
 - [ ] Logging follow-ups: a span with the charge point ID around the
       session, a JSON output format for journald and log collectors on the
       Pi, `tracing` instead of `println!` in `cp-blink`.
