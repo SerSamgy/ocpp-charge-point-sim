@@ -48,9 +48,15 @@ Incoming CALL from the CSMS: `pending` does not claim it, so `read_loop`
 answers with CALLERROR `NotImplemented`. Malformed or unexpected frames
 are logged and skipped.
 
+Status reports: after Accepted and after every reconnect that skips the
+boot, `session` sends the list from `status16::report` (connector 0, then
+each connector) as ordinary CALLs, one after the other, because only one
+CALL waits for an answer at a time.
+
 Connection life cycle (`session`): connect → BootNotification until
-Accepted → status reports (connector 0, then connector 1) → Heartbeat every `interval` → on loss, wait (back-off or the
-Rejected interval) and connect again. When the reader task ends, every
+Accepted → status reports (connector 0, then connector 1) → Heartbeat
+every `interval` → on loss, wait (back-off or the Rejected interval) and
+connect again. When the reader task ends, every
 waiting and later CALL on that client fails with `Disconnected`, which is
 how `session` learns that the connection is gone. `Station::serve` uses a
 connection until it ends; `run` closes it after Rejected (status 1000) and
