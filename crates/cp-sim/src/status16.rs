@@ -6,17 +6,27 @@
 
 use std::num::NonZeroU32;
 
+use time::UtcDateTime;
+
 use crate::{
     connector::{Fault, State},
     ocpp16::{ChargePointErrorCode, ChargePointStatus, StatusNotificationRequest},
+    timestamp,
 };
 
-/// The report for connector `connector_id` in `state`.
+/// The report for connector `connector_id` in `state`, reached at `at`.
+///
+/// The clock is a parameter, not read here, so the function stays pure.
+/// Which instant to pass is up to the caller (step 4b).
 ///
 /// Connector 0 (the charge point as a whole) is not representable here:
 /// it may only be Available, Unavailable or Faulted, so it gets its own
 /// function when it is needed (step 4b).
-pub fn status_notification(connector_id: NonZeroU32, state: State) -> StatusNotificationRequest {
+pub fn status_notification(
+    connector_id: NonZeroU32,
+    state: State,
+    at: UtcDateTime,
+) -> StatusNotificationRequest {
     let (status, error_code) = match state {
         State::Available => (ChargePointStatus::Available, ChargePointErrorCode::NoError),
         State::Preparing => (ChargePointStatus::Preparing, ChargePointErrorCode::NoError),
@@ -29,7 +39,7 @@ pub fn status_notification(connector_id: NonZeroU32, state: State) -> StatusNoti
         error_code,
         info: None,
         status,
-        timestamp: None,
+        timestamp: timestamp::rfc3339(at),
         vendor_id: None,
         vendor_error_code: None,
     }
@@ -52,6 +62,7 @@ mod tests {
     use crate::connector::Resume;
 
     const ONE: NonZeroU32 = NonZeroU32::new(1).unwrap();
+    const AT: UtcDateTime = UtcDateTime::UNIX_EPOCH;
 
     const FAULTS: [(Fault, ChargePointErrorCode); 6] = [
         (Fault::GroundFailure, ChargePointErrorCode::GroundFailure),
@@ -74,7 +85,7 @@ mod tests {
             (State::Finishing, ChargePointStatus::Finishing),
         ];
         for (state, status) in states {
-            let req = status_notification(ONE, state);
+            let req = status_notification(ONE, state, AT);
             assert_eq!(req.status, status);
             assert_eq!(req.error_code, ChargePointErrorCode::NoError);
         }
@@ -87,7 +98,7 @@ mod tests {
                 fault,
                 resume: Resume::Available,
             };
-            let req = status_notification(ONE, state);
+            let req = status_notification(ONE, state, AT);
             assert_eq!(req.status, ChargePointStatus::Faulted);
             assert_eq!(req.error_code, code, "{fault:?}");
         }
@@ -105,7 +116,7 @@ mod tests {
                 fault: Fault::OverCurrent,
                 resume,
             };
-            let req = status_notification(ONE, state);
+            let req = status_notification(ONE, state, AT);
             assert_eq!(req.status, ChargePointStatus::Faulted);
             assert_eq!(req.error_code, ChargePointErrorCode::OverCurrentFailure);
         }
@@ -121,7 +132,7 @@ mod tests {
                 resume: Resume::Charging,
             };
             assert_ne!(
-                status_notification(ONE, state).error_code,
+                status_notification(ONE, state, AT).error_code,
                 ChargePointErrorCode::EVCommunicationError
             );
         }
@@ -130,14 +141,23 @@ mod tests {
     #[test]
     fn connector_id_is_passed_through() {
         let two = NonZeroU32::new(2).unwrap();
-        assert_eq!(status_notification(two, State::Available).connector_id, 2);
+        assert_eq!(
+            status_notification(two, State::Available, AT).connector_id,
+            2
+        );
+    }
+
+    #[test]
+    fn timestamp_is_the_given_instant() {
+        let at = UtcDateTime::from_unix_timestamp(1_793_880_000).unwrap();
+        let req = status_notification(ONE, State::Preparing, at);
+        assert_eq!(req.timestamp.as_deref(), Some("2026-11-05T12:00:00Z"));
     }
 
     #[test]
     fn optional_fields_stay_empty() {
-        let req = status_notification(ONE, State::Preparing);
+        let req = status_notification(ONE, State::Preparing, AT);
         assert_eq!(req.info, None);
-        assert_eq!(req.timestamp, None);
         assert_eq!(req.vendor_id, None);
         assert_eq!(req.vendor_error_code, None);
     }

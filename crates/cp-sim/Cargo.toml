@@ -8,6 +8,7 @@ futures-util = { version = "0.3.34", default-features = false, features = ["sink
 rand = "0.10.3"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+time = { version = "0.3.55", features = ["formatting"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-tungstenite = "0.30.0"
 uuid = { version = "1.26.1", features = ["v4"] }

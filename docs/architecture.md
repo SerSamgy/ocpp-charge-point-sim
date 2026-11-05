@@ -11,7 +11,7 @@ structure (crates, modules, message flow, invariants) updates this page.
 |---|---|
 | `crates/cp-sim` | The charge point: an OCPP-J client over WebSocket, Tokio runtime. One binary. |
 | `crates/cp-blink` | GPIO experiments on the Pi (`rppal`): LED, buttons, debouncing. Standalone binaries, not used by `cp-sim` yet (roadmap step 8). Pins: `docs/hardware/`. |
-| `csms/` | Python test CSMS on the `ocpp` library. Answers BootNotification (status sequence and interval configurable through `BOOT_STATUSES`, `BOOT_INTERVAL`), Heartbeat and StatusNotification (logged, empty result); logs the close code of a disconnected charge point. |
+| `csms/` | Python test CSMS on the `ocpp` library. Answers BootNotification (status sequence and interval configurable through `BOOT_STATUSES`, `BOOT_INTERVAL`), Heartbeat and StatusNotification (connector, status, error code and timestamp logged, empty result); logs the close code of a disconnected charge point. |
 
 ## Modules of `cp-sim`
 
@@ -20,12 +20,13 @@ Layered from the wire up; each module uses only the ones above it.
 | Module | Responsibility | Depends on the OCPP version? |
 |---|---|---|
 | `frame` | OCPP-J RPC frame: CALL, CALLRESULT, CALLERROR as a JSON array. | No, same in 1.6 and 2.0.1. |
+| `timestamp` | A UTC instant as RFC 3339 for the wire, whole seconds, with a `Z`; 1.6 and 2.0.1 accept the same text. Not used by `session` yet (step 4b). | No. |
 | `connector` | The state of one connector (Available, Preparing, Charging, Finishing, Faulted) and the events that change it; a pure state machine following the table of 1.6 section 4.9. Not used by `session` yet (step 4b). | No: the state is our own enum, not the 1.6 wire status. |
 | `ocpp16` | OCPP 1.6 payloads; the `Request` trait ties a payload to its action name and response type. | Yes. |
 | `pending` | `PendingCalls`: outstanding CALLs by message ID, each waiting on a `oneshot` channel. | No. |
 | `client` | One WebSocket connection: `Client::call` sends a typed request and waits for the typed answer; the reader task routes incoming frames; `Client::close` sends a Close frame with a status code. | Partly: sub-protocol `ocpp1.6`, `ocpp16::Request`. |
 | `boot` | Maps a BootNotification response to the next step (Accepted, Pending, Rejected). | Yes, 1.6 section 4.2. |
-| `status16` | Maps a connector state to a 1.6 StatusNotification request; connector 0 is not representable. Not used by `session` yet (step 4b). | Yes, through `connector` and `ocpp16`. |
+| `status16` | Maps a connector state and the instant it was reached to a 1.6 StatusNotification request; connector 0 is not representable. Not used by `session` yet (step 4b). | Yes, through `connector` and `ocpp16`. |
 | `backoff` | Wait before a reconnect, OCPP-J 2.0.1 part 4 section 5.4. | No, a transport rule. |
 | `session` | Stays connected until a shutdown signal: connect, boot until Accepted, Heartbeat, reconnect; on the signal, close the connection and return. Owns the state that survives a connection (`Station`). | Yes, through `boot` and `ocpp16`. |
 | `main` | Reads the CSMS URL, rejects a malformed one, fixes the settings, runs `session::run` until Ctrl+C or SIGTERM. | Boot payload is 1.6. |
@@ -99,8 +100,8 @@ does not check that a test still means what the row says; review does.
 
 1.6 is wired in at three places today: the `ocpp16` module, the
 sub-protocol header in `Client::connect`, and the `ocpp16::Request` bound
-of `Client::call`. `frame`, `pending` and `backoff` are already
-version-independent.
+of `Client::call`. `frame`, `pending`, `backoff` and `timestamp` are
+already version-independent.
 
 The plan (roadmap, "Larger blocks"): extract the version-independent
 parts and the `Request` trait into an `ocpp-proto` library crate (an

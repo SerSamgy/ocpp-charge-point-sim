@@ -44,7 +44,11 @@ instead.
          (`status16`) and the CSMS handler. Nothing calls them yet.
          [#11](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/11)
    - [ ] **4b.** Keyboard events from stdin, wiring into `session`,
-         StatusNotification on every transition. Connector 0 needs its
+         StatusNotification on every transition. Decide which instant
+         the caller passes to `status16`: the time of the last transition
+         stored with the connector state (1.6 section 4.9: a status that
+         changed while offline), or the current time for a report after
+         `Accepted` (errata 3.22). Connector 0 needs its
          own function (it may only be Available, Unavailable or Faulted;
          `status16` cannot build it). After `Accepted` and after a
          reconnect without BootNotification, report connector 0 and every
@@ -119,9 +123,14 @@ Found during the migration inventory; carried over as is
       connection", also when it is the server's reply to our own Close.
 - [ ] After a reconnect without BootNotification, send StatusNotification
       for every connector again (step 4b).
-- [ ] StatusNotification `timestamp`: needs a date-time crate (a new
-      dependency, the owner decides). Today it is left out and the CSMS
-      uses its receive time.
+- [x] StatusNotification `timestamp`: whole seconds in UTC from the
+      `time` crate (`timestamp`, `status16`). Done after step 4a,
+      [#12](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/12);
+      the caller passes the instant in step 4b.
+- [ ] Trust in `timestamp`: it comes from the system clock, which on a Pi
+      without an RTC battery can be wrong until NTP has synchronised, and
+      the CSMS believes it. Sync with `currentTime` of
+      BootNotification/Heartbeat (1.6 section 4.2) or check NTP at deploy.
 - [ ] StatusNotification `info` for an EV-side disconnect (`EV side
       disconnected`, 1.6 section 4.9, `StopTransactionOnEVSideDisconnect`):
       needs a reason in the Finishing state; today Unplug while Charging
