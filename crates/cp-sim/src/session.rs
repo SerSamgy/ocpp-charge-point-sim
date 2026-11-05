@@ -1053,6 +1053,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connection_lost_during_an_input_report_reports_the_new_state_again() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+
+        inputs
+            .send(input(ConnectorEvent::PlugIn, T0))
+            .await
+            .unwrap();
+        recv_report(&mut csms).await; // never answered
+        csms.close_connection();
+        reconnect_gap(&mut csms).await;
+
+        // The state was applied before the send, so the reconnect reports
+        // it, with the instant of the input.
+        expect_report(&mut csms, report_payload(0)).await;
+        let preparing = report_at(1, "Preparing", "NoError", "2026-11-05T12:00:00Z");
+        expect_report(&mut csms, preparing).await;
+    }
+
+    #[tokio::test]
     async fn heartbeats_continue_after_the_sender_is_dropped() {
         let mut csms = FakeCsms::start().await;
         let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
