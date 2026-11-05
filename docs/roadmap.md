@@ -35,9 +35,22 @@ instead.
    - [x] **3f.** Graceful shutdown on Ctrl+C and SIGTERM: Close 1001
          Going Away, bounded by a close timeout.
          [#10](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/10)
-4. **Not started.** Connector state machine: Available → Preparing →
+4. **In progress.** Connector state machine: Available → Preparing →
    Charging → Finishing → Available, plus Faulted. StatusNotification on
-   every transition. Events come from the keyboard for now.
+   every transition. Events come from the keyboard for now. Split into
+   two pull requests.
+   - [x] **4a.** The state machine (`connector`), the 1.6
+         StatusNotification payloads, the mapping from state to message
+         (`status16`) and the CSMS handler. Nothing calls them yet.
+         [#11](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/11)
+   - [ ] **4b.** Keyboard events from stdin, wiring into `session`,
+         StatusNotification on every transition. Connector 0 needs its
+         own function (it may only be Available, Unavailable or Faulted;
+         `status16` cannot build it). After `Accepted` and after a
+         reconnect without BootNotification, report connector 0 and every
+         connector (errata 3.22). Removes the `dead_code` expectations on
+         `connector`, `status16` and the StatusNotification items of
+         `ocpp16`.
 5. **Not started.** Transactions: Authorize, StartTransaction,
    StopTransaction, MeterValues with a simulated energy meter.
 
@@ -47,14 +60,14 @@ instead.
 7. **Done.** Four buttons, debouncing, polling vs interrupts. See
    `docs/hardware/`. Imported in `f922c90`.
 8. **Not started.** Join the tracks: buttons become state machine events
-   via Tokio channels, LEDs show connector status. Requires 4, 6, 7.
+   via Tokio channels, LEDs show connector status. Requires 4b, 6, 7.
 9. **Not started.** Debug Probe and the serial console of the Pi over
    UART.
 10. **Not started.** Autostart as a systemd service.
 
 ## Suggested order
 
-4 → 8 → 5 → 10; 9 at any time.
+4a → 4b → 8 → 5 → 10; 9 at any time.
 
 ## Larger blocks after that
 
@@ -105,7 +118,26 @@ Found during the migration inventory; carried over as is
 - [ ] `read_loop` logs every received Close as "server closed
       connection", also when it is the server's reply to our own Close.
 - [ ] After a reconnect without BootNotification, send StatusNotification
-      for every connector again (step 4).
+      for every connector again (step 4b).
+- [ ] StatusNotification `timestamp`: needs a date-time crate (a new
+      dependency, the owner decides). Today it is left out and the CSMS
+      uses its receive time.
+- [ ] StatusNotification `info` for an EV-side disconnect (`EV side
+      disconnected`, 1.6 section 4.9, `StopTransactionOnEVSideDisconnect`):
+      needs a reason in the Finishing state; today Unplug while Charging
+      goes straight to Available.
+- [ ] Other statuses: `SuspendedEV`, `SuspendedEVSE`, `Reserved`,
+      `Unavailable`, and warning error codes such as `EVCommunicationError`
+      together with a non-Faulted status.
+- [ ] `ConnectionTimeOut` (Preparing → Available or Finishing, B1/B6).
+- [ ] B6 (Preparing → Finishing) and F2 (Finishing → Preparing) are in the
+      1.6 table but no event produces them; with the cable still plugged in
+      after Finishing only Unplug works (step 5, where a new user at a
+      plugged-in cable makes F2 natural).
+- [ ] Faults in the connector state machine (step 8): plug and unplug are
+      rejected while faulted, so the remembered pre-fault state may
+      disagree with the real cable, and a second fault cause during Faulted
+      is lost.
 - [ ] Make the reconnect back-off settings (`RetryBackOffWaitMinimum`,
       `RetryBackOffRandomRange`, `RetryBackOffRepeatTimes`) configurable;
       today they are constants in `crates/cp-sim/src/main.rs`.
