@@ -1,6 +1,10 @@
 //! Test helpers shared by the modules of this crate.
 
-use std::time::Duration;
+use std::{
+    io,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::{net::TcpListener, sync::mpsc, time::timeout};
@@ -13,7 +17,52 @@ use tokio_tungstenite::{
     },
 };
 
+use tracing::subscriber::DefaultGuard;
+use tracing_subscriber::EnvFilter;
+
 use crate::frame::Frame;
+
+// --- Log capture ---
+
+/// Collects what `tracing` events log on this thread, as plain text, while
+/// it is alive. Thread-local: it sees events of a test on a `current_thread`
+/// runtime (the `#[tokio::test]` default), not of tasks on other threads.
+pub struct LogCapture {
+    buf: Arc<Mutex<Vec<u8>>>,
+    _guard: DefaultGuard,
+}
+
+struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for BufWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl LogCapture {
+    pub fn start(filter: EnvFilter) -> Self {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&buf);
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(move || BufWriter(Arc::clone(&writer)))
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        Self { buf, _guard: guard }
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8(self.buf.lock().unwrap().clone()).unwrap()
+    }
+}
 
 // --- Fake CSMS: a WebSocket server driven by the test ---
 

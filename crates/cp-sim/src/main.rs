@@ -12,6 +12,7 @@ mod client;
 mod connector;
 mod frame;
 mod keyboard;
+mod logging;
 mod ocpp16;
 mod pending;
 mod session;
@@ -47,6 +48,7 @@ const SETTINGS: Settings = Settings {
 
 #[tokio::main]
 async fn main() -> Result<(), client::BoxError> {
+    logging::init()?;
     let url = std::env::args()
         .nth(1)
         .unwrap_or_else(|| DEFAULT_CSMS_URL.to_string());
