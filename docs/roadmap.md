@@ -54,6 +54,7 @@ instead.
          stamped with the time of the key press; StatusNotification on
          every transition of a live connection; events that happen while
          offline are applied after the reconnect and reported once.
+         [#15](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/15)
 5. **Not started.** Transactions: Authorize, StartTransaction,
    StopTransaction, MeterValues with a simulated energy meter.
 
