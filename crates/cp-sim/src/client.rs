@@ -18,6 +18,7 @@ use tokio_tungstenite::{
         protocol::{CloseFrame, frame::coding::CloseCode},
     },
 };
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::{frame::Frame, ocpp16::Request, pending::PendingCalls};
@@ -118,7 +119,7 @@ impl Client {
         let rx = self.pending.register(id.clone());
         if let Err(err) = self.send_frame(&frame).await {
             self.pending.cancel(&id);
-            eprintln!("failed to send {}: {err}", R::ACTION);
+            warn!(action = R::ACTION, %err, "failed to send the request");
             return Err(CallFailure::Disconnected);
         }
         let frame = match timeout(self.call_timeout, rx).await {
@@ -171,16 +172,16 @@ impl Client {
         }
     }
 
-    /// Serializes a frame, logs it as `>> ...` and writes it to the socket.
+    /// Serializes a frame, logs it (`direction = "out"`) and writes it to the socket.
     async fn send_frame(&self, frame: &Frame) -> Result<(), tungstenite::Error> {
         let text = serde_json::to_string(frame).expect("Frame always serializes");
-        println!(">> {text}");
+        debug!(direction = "out", %text, "frame");
         let mut sink = self.sink.lock().await;
         sink.send(Message::text(text)).await
     }
 }
 
-/// Reads the socket until the connection closes. Logs every text message as `<< ...`.
+/// Reads the socket until the connection closes. Logs every text message (`direction = "in"`).
 /// - responses go to `pending`
 /// - server CALLs get a CALLERROR NotImplemented with empty details
 /// - malformed or unexpected frames are logged and skipped
@@ -190,11 +191,11 @@ async fn read_loop(client: Arc<Client>, mut source: WsSource) {
     while let Some(msg) = source.next().await {
         match msg {
             Ok(Message::Text(text)) => {
-                println!("<< {text}");
+                debug!(direction = "in", %text, "frame");
                 let frame: Frame = match serde_json::from_str(&text) {
                     Ok(frame) => frame,
                     Err(err) => {
-                        eprintln!("ignoring malformed frame: {err}: {text}");
+                        warn!(%err, %text, "ignoring malformed frame");
                         continue;
                     }
                 };
@@ -208,20 +209,20 @@ async fn read_loop(client: Arc<Client>, mut source: WsSource) {
                                 details: json!({}),
                             };
                             if let Err(err) = client.send_frame(&reply).await {
-                                eprintln!("failed to answer {action}: {err}");
+                                warn!(%action, %err, "failed to answer the server's request");
                             }
                         }
-                        other => eprintln!("nobody waits for this frame: {other:?}"),
+                        other => warn!(?other, "nobody waits for this frame"),
                     }
                 }
             }
             Ok(Message::Close(close)) => {
-                println!("server closed connection: {close:?}");
+                info!(?close, "server closed the connection");
                 break;
             }
             Ok(_) => {} // ping/pong/binary
             Err(e) => {
-                eprintln!("connection error: {e}");
+                warn!(error = %e, "connection error");
                 break;
             }
         }
@@ -229,13 +230,13 @@ async fn read_loop(client: Arc<Client>, mut source: WsSource) {
     // Nobody will answer the CALLs still waiting: let them fail now
     // instead of running into their timeout.
     client.pending.close();
-    println!("connection closed")
+    info!("connection closed")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::echo_ocpp16;
+    use crate::test_support::{LogCapture, echo_ocpp16};
     use crate::{
         ocpp16::{
             ChargePointErrorCode, ChargePointStatus, HeartbeatRequest, HeartbeatResponse,
@@ -245,6 +246,7 @@ mod tests {
     };
     use tokio::{net::TcpListener, time::timeout};
     use tokio_tungstenite::accept_hdr_async;
+    use tracing_subscriber::EnvFilter;
 
     const LONG: Duration = Duration::from_secs(5);
     const SHORT: Duration = Duration::from_millis(300);
@@ -293,6 +295,26 @@ mod tests {
         csms.send(heartbeat_result(&id));
         let resp = call.await.unwrap().unwrap();
         assert_eq!(resp.current_time, "2026-10-15T12:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn frames_are_logged_with_their_direction() {
+        let logs = LogCapture::start(EnvFilter::new("cp_sim=debug"));
+        let mut csms = FakeCsms::start().await;
+        let (client, _reader) = Client::connect(&csms.url, timeouts(LONG)).await.unwrap();
+
+        let call = spawn_heartbeat(&client);
+        let Frame::Call { id, .. } = csms.recv().await else {
+            panic!("expected a CALL");
+        };
+        csms.send(heartbeat_result(&id));
+        call.await.unwrap().unwrap();
+
+        let text = logs.text();
+        let sent = text.lines().find(|l| l.contains("direction=\"out\""));
+        let received = text.lines().find(|l| l.contains("direction=\"in\""));
+        assert!(sent.is_some_and(|l| l.contains("Heartbeat")), "{text}");
+        assert!(received.is_some_and(|l| l.contains(&id)), "{text}");
     }
 
     #[tokio::test]

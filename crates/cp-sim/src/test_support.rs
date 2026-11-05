@@ -1,8 +1,9 @@
 //! Test helpers shared by the modules of this crate.
 
 use std::{
+    cell::RefCell,
     io,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Once},
     time::Duration,
 };
 
@@ -17,19 +18,75 @@ use tokio_tungstenite::{
     },
 };
 
-use tracing::subscriber::DefaultGuard;
+use tracing::{Dispatch, Event as TracingEvent, Metadata, Subscriber, span, subscriber::Interest};
 use tracing_subscriber::EnvFilter;
 
 use crate::frame::Frame;
 
 // --- Log capture ---
 
+thread_local! {
+    /// The subscriber of the capture running on this thread, if any.
+    static CAPTURE: RefCell<Option<Dispatch>> = const { RefCell::new(None) };
+}
+
+/// The one global subscriber of the test binary: it hands every event to
+/// the capture of the thread that emitted it, and drops it if there is none.
+///
+/// Why not `tracing::subscriber::set_default` per test: `tracing` caches,
+/// per call site, whether anybody is interested, and tests run in parallel.
+/// A test thread without a subscriber that reaches a call site first can
+/// cache "nobody" and the capturing test then misses the event. Answering
+/// `sometimes` here keeps every call site asking `enabled` each time.
+struct Forward;
+
+impl Subscriber for Forward {
+    fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
+        Interest::sometimes()
+    }
+
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        CAPTURE.with_borrow(|capture| capture.as_ref().is_some_and(|d| d.enabled(metadata)))
+    }
+
+    fn event(&self, event: &TracingEvent<'_>) {
+        CAPTURE.with_borrow(|capture| {
+            if let Some(dispatch) = capture {
+                dispatch.event(event);
+            }
+        });
+    }
+
+    // No spans in this crate yet, so only the minimum.
+    fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+        span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+
+    fn enter(&self, _: &span::Id) {}
+
+    fn exit(&self, _: &span::Id) {}
+}
+
+/// Installs [`Forward`] once. Every test that logs through a call site that
+/// a capture looks at must call this before it logs, so that no thread can
+/// cache an answer from the time when there was no subscriber.
+fn install_forwarding_subscriber() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        tracing::subscriber::set_global_default(Forward).expect("no other global subscriber");
+    });
+}
+
 /// Collects what `tracing` events log on this thread, as plain text, while
-/// it is alive. Thread-local: it sees events of a test on a `current_thread`
-/// runtime (the `#[tokio::test]` default), not of tasks on other threads.
+/// it is alive. Per thread: it sees the events of a test on a
+/// `current_thread` runtime (the `#[tokio::test]` default), not of tasks on
+/// other threads.
 pub struct LogCapture {
     buf: Arc<Mutex<Vec<u8>>>,
-    _guard: DefaultGuard,
 }
 
 struct BufWriter(Arc<Mutex<Vec<u8>>>);
@@ -47,6 +104,7 @@ impl io::Write for BufWriter {
 
 impl LogCapture {
     pub fn start(filter: EnvFilter) -> Self {
+        install_forwarding_subscriber();
         let buf = Arc::new(Mutex::new(Vec::new()));
         let writer = Arc::clone(&buf);
         let subscriber = tracing_subscriber::fmt()
@@ -55,12 +113,18 @@ impl LogCapture {
             .with_ansi(false)
             .without_time()
             .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        Self { buf, _guard: guard }
+        CAPTURE.set(Some(Dispatch::new(subscriber)));
+        Self { buf }
     }
 
     pub fn text(&self) -> String {
         String::from_utf8(self.buf.lock().unwrap().clone()).unwrap()
+    }
+}
+
+impl Drop for LogCapture {
+    fn drop(&mut self) {
+        CAPTURE.set(None);
     }
 }
 
@@ -106,6 +170,7 @@ pub struct FakeCsms {
 
 impl FakeCsms {
     pub async fn start() -> Self {
+        install_forwarding_subscriber();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/CP001", listener.local_addr().unwrap());
         let (event_tx, events) = mpsc::unbounded_channel();
