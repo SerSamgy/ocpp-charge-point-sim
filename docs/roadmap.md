@@ -35,28 +35,26 @@ instead.
    - [x] **3f.** Graceful shutdown on Ctrl+C and SIGTERM: Close 1001
          Going Away, bounded by a close timeout.
          [#10](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/10)
-4. **In progress.** Connector state machine: Available → Preparing →
-   Charging → Finishing → Available, plus Faulted. StatusNotification on
-   every transition. Events come from the keyboard for now. Split into
-   two pull requests.
+4. **Done.** Connector state machine: Available → Preparing → Charging →
+   Finishing → Available, plus Faulted. StatusNotification on every
+   transition. Events come from the keyboard for now. Done in three pull
+   requests.
    - [x] **4a.** The state machine (`connector`), the 1.6
          StatusNotification payloads, the mapping from state to message
-         (`status16`) and the CSMS handler. Nothing calls them yet.
+         (`status16`) and the CSMS handler.
          [#11](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/11)
-   - [ ] **4b.** Split into two pull requests.
-     - [x] **4b-1.** The station keeps a record per connector and reports
-           connector 0 and connector 1 (always Available so far) after
-           every `Accepted` and after every reconnect without
-           BootNotification (errata 3.22). Each report carries the instant
-           the status was reached. First check of StatusNotification
-           from the Rust client against `just csms`.
-           [#14](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/14)
-     - [ ] **4b-2.** Keyboard events (`plug`, `start`, `stop`, `unplug`,
-           `fault <kind>`, `clear`) from stdin on a thread of its own,
-           stamped with the time of the key press; StatusNotification on
-           every transition of a live connection; events that happen
-           while offline are applied after the reconnect and reported
-           once. Removes the last `dead_code` expectation (`connector`).
+   - [x] **4b-1.** The station keeps a record per connector and reports
+         connector 0 and connector 1 after every `Accepted` and after
+         every reconnect without BootNotification (errata 3.22). Each
+         report carries the instant the status was reached. First check
+         of StatusNotification from the Rust client against `just csms`.
+         [#14](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/14)
+   - [x] **4b-2.** Keyboard events (`plug`, `start`, `stop`, `unplug`,
+         `fault <kind>`, `clear`) from stdin on a thread of its own,
+         stamped with the time of the key press; StatusNotification on
+         every transition of a live connection; events that happen while
+         offline are applied after the reconnect and reported once.
+         [#15](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/15)
 5. **Not started.** Transactions: Authorize, StartTransaction,
    StopTransaction, MeterValues with a simulated energy meter.
 
@@ -66,14 +64,14 @@ instead.
 7. **Done.** Four buttons, debouncing, polling vs interrupts. See
    `docs/hardware/`. Imported in `f922c90`.
 8. **Not started.** Join the tracks: buttons become state machine events
-   via Tokio channels, LEDs show connector status. Requires 4b, 6, 7.
+   via Tokio channels, LEDs show connector status. Requires 4, 6, 7.
 9. **Not started.** Debug Probe and the serial console of the Pi over
    UART.
 10. **Not started.** Autostart as a systemd service.
 
 ## Suggested order
 
-4a → 4b → 8 → 5 → 10; 9 at any time.
+8 → 5 → 10; 9 at any time.
 
 ## Larger blocks after that
 
@@ -126,6 +124,14 @@ Found during the migration inventory; carried over as is
 - [x] After a reconnect without BootNotification, send StatusNotification
       for every connector again. Done in step 4b-1,
       [#14](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/14).
+- [ ] A keyboard command is checked against the connector state only
+      when the session applies it, after Accepted, so the message for a
+      command that does not fit can come late (after a reconnect, which
+      can take hours after Rejected). Needs the state in the keyboard
+      thread or a reply channel; a limitation until buttons replace the
+      keyboard (step 8).
+- [ ] `MinimumStatusDuration` (1.6 section 4.9): do not report a status
+      that lasted less than the configured time.
 - [ ] Retry a StatusNotification that failed on a live connection
       (timeout, CALLERROR): today it is logged and the CSMS may stay out
       of date until the next reconnect re-reports everything.

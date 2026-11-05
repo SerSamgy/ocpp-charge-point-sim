@@ -21,15 +21,16 @@ Layered from the wire up; each module uses only the ones above it.
 |---|---|---|
 | `frame` | OCPP-J RPC frame: CALL, CALLRESULT, CALLERROR as a JSON array. | No, same in 1.6 and 2.0.1. |
 | `timestamp` | A UTC instant as RFC 3339 for the wire, whole seconds, with a `Z`; 1.6 and 2.0.1 accept the same text. Used by `status16`. | No. |
-| `connector` | The state of one connector (Available, Preparing, Charging, Finishing, Faulted) and the events that change it; a pure state machine following the table of 1.6 section 4.9; `Connector` is the record the station keeps (number, state, instant the state was reached). `session` keeps the records; the events are not wired in yet (step 4b-2). | No: the state is our own enum, not the 1.6 wire status. |
+| `connector` | The state of one connector (Available, Preparing, Charging, Finishing, Faulted) and the events that change it; a pure state machine following the table of 1.6 section 4.9; `Connector` is the record the station keeps (number, state, instant the state was reached). `session` keeps the records and applies the events. | No: the state is our own enum, not the 1.6 wire status. |
+| `keyboard` | Commands typed on the keyboard (`plug`, `start`, `stop`, `unplug`, `clear`, `fault <kind>`) as connector events, each stamped with the instant it was typed (`Input`); `parse` is pure, `spawn` reads stdin on a thread of its own. | No. |
 | `ocpp16` | OCPP 1.6 payloads; the `Request` trait ties a payload to its action name and response type. | Yes. |
 | `pending` | `PendingCalls`: outstanding CALLs by message ID, each waiting on a `oneshot` channel. | No. |
 | `client` | One WebSocket connection: `Client::call` sends a typed request and waits for the typed answer; the reader task routes incoming frames; `Client::close` sends a Close frame with a status code. | Partly: sub-protocol `ocpp1.6`, `ocpp16::Request`. |
 | `boot` | Maps a BootNotification response to the next step (Accepted, Pending, Rejected). | Yes, 1.6 section 4.2. |
 | `status16` | Maps a connector state and the instant it was reached to a 1.6 StatusNotification request; `report` builds the list sent after Accepted and after a reconnect (errata 3.22): connector 0, then every connector. Connector 0 is not representable by `status_notification`. | Yes, through `connector` and `ocpp16`. |
 | `backoff` | Wait before a reconnect, OCPP-J 2.0.1 part 4 section 5.4. | No, a transport rule. |
-| `session` | Stays connected until a shutdown signal: connect, boot until Accepted, report the status of connector 0 and the connector, Heartbeat, reconnect; on the signal, close the connection and return. Owns the state that survives a connection (`Station`). | Yes, through `boot` and `ocpp16`. |
-| `main` | Reads the CSMS URL, rejects a malformed one, fixes the settings, runs `session::run` until Ctrl+C or SIGTERM. | Boot payload is 1.6. |
+| `session` | Stays connected until a shutdown signal: connect, boot until Accepted, report the status of connector 0 and the connector, apply keyboard events and report each one, Heartbeat, reconnect; on the signal, close the connection and return. Owns the state that survives a connection (`Station`). | Yes, through `boot` and `ocpp16`. |
+| `main` | Reads the CSMS URL, rejects a malformed one, fixes the settings, creates the input channel and starts the keyboard thread (`keyboard::spawn`), runs `session::run` until Ctrl+C or SIGTERM. | Boot payload is 1.6. |
 | `test_support` | Tests only: `FakeCsms`, a WebSocket server driven by the test. | 1.6 sub-protocol. |
 
 ## Message flow
@@ -53,6 +54,19 @@ boot, `session` sends the list from `status16::report` (connector 0, then
 each connector) as ordinary CALLs, one after the other, because only one
 CALL waits for an answer at a time.
 
+Keyboard events: `main` starts the keyboard thread (`keyboard::spawn`),
+which sends `Input`s over a bounded channel to `session::run`. `session`
+reads them only after Accepted (until then they wait in the channel):
+`keep_alive` applies the events that waited, in order, and reports the
+final status once with the other reports, then applies each new event at
+once and sends one StatusNotification for it. Every input carries the
+instant it was typed, and the connector keeps it as `since`, so a report
+shows when the status was reached. A command that does not fit the state
+is printed and changes nothing; because the state is checked only when the
+input is applied, the message can come late, after a reconnect. If stdin
+ends, the sender is dropped and `session` stops listening to the channel
+for good; the station keeps running.
+
 Connection life cycle (`session`): connect → BootNotification until
 Accepted → status reports (connector 0, then connector 1) → Heartbeat
 every `interval` → on loss, wait (back-off or the Rejected interval) and
@@ -71,7 +85,9 @@ once. The close after Rejected is deliberately not raced against the
 signal: cancelling it half way would start a second wait for the
 shutdown close, so a signal during it lets it finish (at most
 `close_timeout`) and stops `run` in the wait that follows. OCPP 1.6 and 2.0.1 define nothing for this, so the close codes come
-from RFC 6455 section 7.4.1.
+from RFC 6455 section 7.4.1. The keyboard thread is a plain thread that is
+never joined, not `tokio::io::stdin`: a pending read of that would keep the
+runtime from stopping until Enter is pressed.
 
 ## Invariants
 
@@ -93,7 +109,10 @@ does not check that a test still means what the row says; review does.
 | A failed CALL (timeout, CALLERROR) on a live connection does not end the connection or the program. | `session::failed_boot_is_retried_on_same_connection`, `session::heartbeat_call_error_keeps_connection`, `session::heartbeat_timeout_keeps_connection`, `session::report_call_error_keeps_connection`, `session::report_timeout_keeps_connection` |
 | Back-off grows while connecting fails and resets only after a successful OCPP exchange, not after a bare handshake. | `session::backoff_grows_while_connect_fails`, `session::handshake_alone_does_not_reset_backoff`, `session::successful_exchange_resets_backoff`, `session::successful_report_resets_backoff`, `backoff::doubles_up_to_repeat_times_then_stays` |
 | Back-off arithmetic saturates instead of panicking on huge settings. | `backoff::huge_settings_saturate_instead_of_panicking` |
-| On shutdown the client closes an open connection with 1001 Going Away and does not wait for a CALL in flight. | `session::shutdown_closes_connection_and_returns`, `session::shutdown_during_boot_call_closes_connection`, `session::shutdown_during_heartbeat_call_closes_connection`, `session::shutdown_during_report_closes_connection` |
+| On shutdown the client closes an open connection with 1001 Going Away and does not wait for a CALL in flight. | `session::shutdown_closes_connection_and_returns`, `session::shutdown_during_boot_call_closes_connection`, `session::shutdown_during_heartbeat_call_closes_connection`, `session::shutdown_during_report_closes_connection`, `session::shutdown_during_status_notification_closes_connection` |
+| A keyboard event is applied only after Accepted. On a live connection a valid event sends one StatusNotification carrying the instant the event was typed; an event that does not fit sends nothing and changes nothing; events that waited are applied in order and reported once, with the instant of the last one. | `session::input_sends_status_notification`, `session::invalid_event_sends_nothing`, `session::fault_reports_the_error_code_and_clear_returns_to_the_pre_fault_state`, `session::inputs_wait_until_boot_is_accepted`, `session::inputs_while_offline_are_reported_once_with_the_time_of_the_last_one`, `session::connection_lost_during_an_input_report_reports_the_new_state_again` |
+| The end of the keyboard input does not stop the station or make it spin. | `session::heartbeats_continue_after_the_sender_is_dropped` |
+| The keyboard reader skips a bad line, also one that is not UTF-8, and ends on a read error or when the session is gone. | `keyboard::a_line_that_is_not_utf8_is_skipped_and_reading_goes_on`, `keyboard::a_read_error_ends_the_reader`, `keyboard::a_dropped_receiver_ends_the_reader_after_the_first_line` |
 | Shutdown never waits for a back-off, the wait after Rejected or a connect timeout. | `session::shutdown_during_backoff_returns_at_once`, `session::shutdown_during_rejected_wait_returns_at_once`, `session::shutdown_during_connect_returns_at_once` |
 | `disconnect` never awaits a reader task that was already awaited to the end (that panics). | `session::disconnect_after_reader_was_awaited_does_not_panic` |
 | Shutdown ends within `close_timeout` even if the server never answers the Close. The timeout also covers sending the Close; a send that hangs on a full socket buffer is not tested, as a small Close frame always fits into the kernel buffer. | `session::shutdown_gives_up_after_close_timeout` |
