@@ -19,6 +19,7 @@ use std::{
 
 use time::UtcDateTime;
 use tokio::sync::mpsc;
+use tracing::warn;
 
 use crate::connector::{Event, Fault};
 
@@ -72,7 +73,7 @@ pub fn spawn(inputs: mpsc::Sender<Input>) -> io::Result<()> {
                 eprintln!("{HELP}");
             }
             read_inputs(stdin.lock(), &inputs, UtcDateTime::now);
-            eprintln!("keyboard input ended; the station keeps running without it");
+            warn!("keyboard input ended; the station keeps running without it");
         })?;
     Ok(())
 }
@@ -100,7 +101,7 @@ fn read_inputs(
                 continue;
             }
             Err(err) => {
-                eprintln!("cannot read the keyboard: {err}");
+                warn!(%err, "cannot read the keyboard");
                 return;
             }
         }

@@ -25,6 +25,7 @@ use std::{io, time::Duration};
 
 use time::UtcDateTime;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tracing::{info, warn};
 
 use crate::{
     backoff::BackoffConfig, client::Timeouts, ocpp16::BootNotificationRequest, session::Settings,
@@ -93,13 +94,13 @@ fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 if let Err(err) = result {
-                    eprintln!("cannot listen for Ctrl+C: {err}; only SIGTERM stops the program");
+                    warn!(%err, "cannot listen for Ctrl+C; only SIGTERM stops the program");
                     terminate.recv().await;
                 }
             }
             _ = terminate.recv() => {}
         }
-        println!("shutting down");
+        info!("shutting down");
     })
 }
 
@@ -108,9 +109,9 @@ fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
 fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
     Ok(async {
         if let Err(err) = tokio::signal::ctrl_c().await {
-            eprintln!("cannot listen for Ctrl+C: {err}; the program runs until killed");
+            warn!(%err, "cannot listen for Ctrl+C; the program runs until killed");
             std::future::pending::<()>().await;
         }
-        println!("shutting down");
+        info!("shutting down");
     })
 }
