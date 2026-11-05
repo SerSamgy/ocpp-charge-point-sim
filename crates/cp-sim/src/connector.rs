@@ -100,13 +100,13 @@ impl State {
             }
             // I1-I8
             (State::Faulted { resume, .. }, Event::ClearFault) => Ok(resume.into()),
-            // While faulted, only clearing the fault is possible.
-            (State::Faulted { .. }, _) => Err(InvalidEvent { state: self, event }),
             // A9, B9, C9, F9
             (State::Available, Event::Fault(fault)) => faulted(fault, Resume::Available),
             (State::Preparing, Event::Fault(fault)) => faulted(fault, Resume::Preparing),
             (State::Charging, Event::Fault(fault)) => faulted(fault, Resume::Charging),
             (State::Finishing, Event::Fault(fault)) => faulted(fault, Resume::Finishing),
+            // Everything else, in particular every event except `ClearFault`
+            // while faulted: none of the arms above matches a faulted state.
             _ => Err(InvalidEvent { state: self, event }),
         }
     }
