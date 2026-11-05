@@ -237,7 +237,10 @@ mod tests {
     use super::*;
     use crate::test_support::echo_ocpp16;
     use crate::{
-        ocpp16::{HeartbeatRequest, HeartbeatResponse},
+        ocpp16::{
+            ChargePointErrorCode, ChargePointStatus, HeartbeatRequest, HeartbeatResponse,
+            StatusNotificationRequest, StatusNotificationResponse,
+        },
         test_support::{Event, FakeCsms},
     };
     use tokio::{net::TcpListener, time::timeout};
@@ -290,6 +293,42 @@ mod tests {
         csms.send(heartbeat_result(&id));
         let resp = call.await.unwrap().unwrap();
         assert_eq!(resp.current_time, "2026-10-15T12:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn call_encodes_status_notification_and_decodes_empty_result() {
+        let mut csms = FakeCsms::start().await;
+        let (client, _reader) = Client::connect(&csms.url, timeouts(LONG)).await.unwrap();
+
+        let request = StatusNotificationRequest {
+            connector_id: 1,
+            error_code: ChargePointErrorCode::NoError,
+            info: None,
+            status: ChargePointStatus::Preparing,
+            timestamp: None,
+            vendor_id: None,
+            vendor_error_code: None,
+        };
+        let call = tokio::spawn(async move { client.call(&request).await });
+        let Frame::Call {
+            id,
+            action,
+            payload,
+        } = csms.recv().await
+        else {
+            panic!("expected a CALL");
+        };
+        assert_eq!(action, "StatusNotification");
+        assert_eq!(
+            payload,
+            json!({"connectorId": 1, "errorCode": "NoError", "status": "Preparing"})
+        );
+
+        csms.send(Frame::CallResult {
+            id,
+            payload: json!({}),
+        });
+        assert_eq!(call.await.unwrap().unwrap(), StatusNotificationResponse {});
     }
 
     #[tokio::test]

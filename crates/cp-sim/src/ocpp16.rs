@@ -59,6 +59,74 @@ impl Request for HeartbeatRequest {
     type Response = HeartbeatResponse;
 }
 
+// --- StatusNotification ---
+
+/// Only `connector_id`, `error_code` and `status` are required by the
+/// schema. `timestamp` stays empty for now: the CSMS uses its receive time.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired into session in step 4b"))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusNotificationRequest {
+    pub connector_id: u32,
+    pub error_code: ChargePointErrorCode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub info: Option<String>,
+    pub status: ChargePointStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor_error_code: Option<String>,
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "wired into session in step 4b"))]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StatusNotificationResponse {}
+
+/// Every status of the schema, although the connector state machine uses
+/// only some of them so far.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired into session in step 4b"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChargePointStatus {
+    Available,
+    Preparing,
+    Charging,
+    SuspendedEV,
+    SuspendedEVSE,
+    Finishing,
+    Reserved,
+    Unavailable,
+    Faulted,
+}
+
+/// Every error code of the schema.
+#[cfg_attr(not(test), expect(dead_code, reason = "wired into session in step 4b"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChargePointErrorCode {
+    ConnectorLockFailure,
+    EVCommunicationError,
+    GroundFailure,
+    HighTemperature,
+    InternalError,
+    LocalListConflict,
+    NoError,
+    OtherError,
+    OverCurrentFailure,
+    PowerMeterFailure,
+    PowerSwitchFailure,
+    ReaderFailure,
+    ResetFailure,
+    UnderVoltage,
+    OverVoltage,
+    WeakSignal,
+}
+
+impl Request for StatusNotificationRequest {
+    const ACTION: &'static str = "StatusNotification";
+    type Response = StatusNotificationResponse;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +179,125 @@ mod tests {
         let req = HeartbeatRequest {};
 
         assert_eq!(serde_json::to_value(&req).unwrap(), json!({}));
+    }
+
+    fn status_notification() -> StatusNotificationRequest {
+        StatusNotificationRequest {
+            connector_id: 1,
+            error_code: ChargePointErrorCode::NoError,
+            info: None,
+            status: ChargePointStatus::Preparing,
+            timestamp: None,
+            vendor_id: None,
+            vendor_error_code: None,
+        }
+    }
+
+    #[test]
+    fn status_notification_request_omits_absent_optionals() {
+        assert_eq!(
+            serde_json::to_value(status_notification()).unwrap(),
+            json!({"connectorId": 1, "errorCode": "NoError", "status": "Preparing"})
+        );
+    }
+
+    #[test]
+    fn status_notification_request_includes_present_optionals() {
+        let req = StatusNotificationRequest {
+            info: Some("cable stuck".into()),
+            timestamp: Some("2026-11-05T12:00:00Z".into()),
+            vendor_id: Some("Semyon".into()),
+            vendor_error_code: Some("E42".into()),
+            ..status_notification()
+        };
+        assert_eq!(
+            serde_json::to_value(req).unwrap(),
+            json!({
+                "connectorId": 1,
+                "errorCode": "NoError",
+                "info": "cable stuck",
+                "status": "Preparing",
+                "timestamp": "2026-11-05T12:00:00Z",
+                "vendorId": "Semyon",
+                "vendorErrorCode": "E42",
+            })
+        );
+    }
+
+    #[test]
+    fn status_notification_response_parses_empty_object() {
+        let resp = serde_json::from_str::<StatusNotificationResponse>("{}").unwrap();
+        assert_eq!(resp, StatusNotificationResponse {});
+    }
+
+    #[test]
+    fn charge_point_status_matches_the_schema_strings() {
+        // The `status` enum of StatusNotification.json, in schema order.
+        let schema = [
+            (ChargePointStatus::Available, "Available"),
+            (ChargePointStatus::Preparing, "Preparing"),
+            (ChargePointStatus::Charging, "Charging"),
+            (ChargePointStatus::SuspendedEV, "SuspendedEV"),
+            (ChargePointStatus::SuspendedEVSE, "SuspendedEVSE"),
+            (ChargePointStatus::Finishing, "Finishing"),
+            (ChargePointStatus::Reserved, "Reserved"),
+            (ChargePointStatus::Unavailable, "Unavailable"),
+            (ChargePointStatus::Faulted, "Faulted"),
+        ];
+        for (status, text) in schema {
+            assert_eq!(serde_json::to_value(status).unwrap(), json!(text));
+            assert_eq!(
+                serde_json::from_value::<ChargePointStatus>(json!(text)).unwrap(),
+                status
+            );
+        }
+    }
+
+    #[test]
+    fn charge_point_error_code_matches_the_schema_strings() {
+        // The `errorCode` enum of StatusNotification.json, in schema order.
+        let schema = [
+            (
+                ChargePointErrorCode::ConnectorLockFailure,
+                "ConnectorLockFailure",
+            ),
+            (
+                ChargePointErrorCode::EVCommunicationError,
+                "EVCommunicationError",
+            ),
+            (ChargePointErrorCode::GroundFailure, "GroundFailure"),
+            (ChargePointErrorCode::HighTemperature, "HighTemperature"),
+            (ChargePointErrorCode::InternalError, "InternalError"),
+            (ChargePointErrorCode::LocalListConflict, "LocalListConflict"),
+            (ChargePointErrorCode::NoError, "NoError"),
+            (ChargePointErrorCode::OtherError, "OtherError"),
+            (
+                ChargePointErrorCode::OverCurrentFailure,
+                "OverCurrentFailure",
+            ),
+            (ChargePointErrorCode::PowerMeterFailure, "PowerMeterFailure"),
+            (
+                ChargePointErrorCode::PowerSwitchFailure,
+                "PowerSwitchFailure",
+            ),
+            (ChargePointErrorCode::ReaderFailure, "ReaderFailure"),
+            (ChargePointErrorCode::ResetFailure, "ResetFailure"),
+            (ChargePointErrorCode::UnderVoltage, "UnderVoltage"),
+            (ChargePointErrorCode::OverVoltage, "OverVoltage"),
+            (ChargePointErrorCode::WeakSignal, "WeakSignal"),
+        ];
+        for (code, text) in schema {
+            assert_eq!(serde_json::to_value(code).unwrap(), json!(text));
+            assert_eq!(
+                serde_json::from_value::<ChargePointErrorCode>(json!(text)).unwrap(),
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_charge_point_status_fails() {
+        let err = serde_json::from_value::<ChargePointStatus>(json!("Occupied")).unwrap_err();
+        assert!(err.is_data(), "unexpected error kind: {err}");
     }
 }
