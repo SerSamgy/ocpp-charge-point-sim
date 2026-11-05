@@ -60,10 +60,12 @@ class ChargePoint(cp):
         return call_result.Heartbeat(current_time=now_iso())
 
     @on(Action.status_notification)
-    def on_status_notification(self, connector_id, error_code, status, **kwargs):
+    def on_status_notification(
+        self, connector_id, error_code, status, timestamp=None, **kwargs
+    ):
         logger.info(
             f"StatusNotification from {self.id}: connector={connector_id} "
-            f"status={status} error_code={error_code}"
+            f"status={status} error_code={error_code} timestamp={timestamp}"
         )
         return call_result.StatusNotification()
 
