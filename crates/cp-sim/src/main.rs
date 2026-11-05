@@ -66,7 +66,17 @@ async fn main() -> Result<(), client::BoxError> {
         charge_point_serial_number: None,
         firmware_version: None,
     };
-    session::run(&url, SETTINGS, &request, UtcDateTime::now(), shutdown).await;
+    // No keyboard yet: the sender stays here, so the channel stays open.
+    let (_inputs_tx, inputs) = tokio::sync::mpsc::channel(32);
+    session::run(
+        &url,
+        SETTINGS,
+        &request,
+        UtcDateTime::now(),
+        inputs,
+        shutdown,
+    )
+    .await;
     Ok(())
 }
 

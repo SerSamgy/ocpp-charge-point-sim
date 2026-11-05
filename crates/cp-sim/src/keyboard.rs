@@ -13,11 +13,22 @@
 
 use std::fmt;
 
+use time::UtcDateTime;
+
 use crate::connector::{Event, Fault};
 
 /// Printed by the `help` command and when stdin is a terminal.
 pub const HELP: &str = "commands: plug, start, stop, unplug, clear, fault <kind>, help\n\
                         fault kinds: ground, overcurrent, overvoltage, undervoltage, temperature, other";
+
+/// An event with the instant the user typed it. The instant is the time the
+/// connector reaches its new status, even if the station applies the event
+/// later, after a reconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Input {
+    pub event: Event,
+    pub at: UtcDateTime,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseError {

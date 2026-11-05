@@ -2,13 +2,15 @@
 //! report the status of the charge point and its connector, Heartbeat, and
 //! reconnect with back-off whenever the connection is lost. After every
 //! Accepted and after every reconnect that skips the boot, the status is
-//! reported again (OCPP 1.6 errata 3.22).
+//! reported again (OCPP 1.6 errata 3.22). Events from the keyboard change the
+//! state of the connector; each one on a live connection is reported at once.
 
 use std::{num::NonZeroU32, time::Duration};
 
 use rand::rngs::StdRng;
 use time::UtcDateTime;
 use tokio::{
+    sync::mpsc,
     task::JoinHandle,
     time::{MissedTickBehavior, interval, sleep, timeout},
 };
@@ -19,7 +21,8 @@ use crate::{
     boot::{self, BootStep},
     client::{CallFailure, Client, Timeouts},
     connector::Connector,
-    ocpp16::{BootNotificationRequest, HeartbeatRequest},
+    keyboard::Input,
+    ocpp16::{BootNotificationRequest, HeartbeatRequest, StatusNotificationRequest},
     status16,
 };
 
@@ -51,6 +54,13 @@ pub struct Settings {
 ///   was reached so far. It is fixed for the whole run, so a Pi that starts
 ///   before NTP has synchronised reports that wrong time until a restart
 ///   (roadmap backlog, "Trust in `timestamp`").
+/// - `inputs` carries keyboard events with the instant they were typed. They
+///   are applied only while the station is allowed to talk (after Accepted):
+///   on a live connection each one is applied and reported at once; events
+///   that came while connecting, booting or waiting are applied in order
+///   when the connection becomes usable, and the final status is reported
+///   once (section 4.9: no historical changes). `since` of the connector is
+///   the instant of the last event, not the time of the report.
 /// - A failed CALL that leaves the connection up is logged and retried.
 /// - On `shutdown`: close an open connection with 1001 Going Away (RFC 6455
 ///   section 7.4.1) and return within `close_timeout`; a CALL in flight is
@@ -60,6 +70,7 @@ pub async fn run(
     settings: Settings,
     request: &BootNotificationRequest,
     started: UtcDateTime,
+    inputs: mpsc::Receiver<Input>,
     shutdown: impl Future<Output = ()>,
 ) {
     // `select!` polls `shutdown` by `&mut` in several places, and a future
@@ -71,6 +82,7 @@ pub async fn run(
         heartbeat: None,
         started,
         connectors: vec![Connector::new(CONNECTOR_ID, started)],
+        inputs: Some(inputs),
         backoff: Backoff::new(settings.backoff),
         // `StdRng` is `Send`, unlike `rand::rng()`, so the future of `run`
         // can move between Tokio worker threads.
@@ -143,8 +155,25 @@ struct Station<'a> {
     /// When the program started; the time of the status of connector 0.
     started: UtcDateTime,
     connectors: Vec<Connector>,
+    /// Keyboard events; `None` once the sender is gone (stdin closed), so a
+    /// closed channel is never polled again.
+    inputs: Option<mpsc::Receiver<Input>>,
     backoff: Backoff,
     rng: StdRng,
+}
+
+/// The next input; waits forever if there is no source (any more).
+/// `recv` is cancel-safe, and a closed channel turns the option into `None`
+/// and then waits for good instead of returning `None` over and over, which
+/// would make a `select!` loop spin.
+async fn next_input(inputs: &mut Option<mpsc::Receiver<Input>>) -> Input {
+    if let Some(receiver) = inputs {
+        if let Some(input) = receiver.recv().await {
+            return input;
+        }
+        *inputs = None;
+    }
+    std::future::pending().await
 }
 
 /// Why a connection ended.
@@ -226,6 +255,9 @@ impl Station<'_> {
         // ticks in a burst; just start counting again.
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         ticker.tick().await; // first tick completes immediately — skip it
+        // Events that waited for this moment are applied first, so the
+        // report below shows the final status.
+        self.apply_queued();
         if let Err(ended) = self.report_all(client).await {
             return ended;
         }
@@ -236,6 +268,15 @@ impl Station<'_> {
                     Err(CallFailure::Disconnected) => return Ended::Lost,
                     Err(err) => eprintln!("Heartbeat failed: {err}"),
                 },
+                // `select!` drops the other futures before it runs a handler,
+                // so the handler may use `self` again.
+                input = next_input(&mut self.inputs) => {
+                    if let Some(request) = self.apply(input)
+                        && let Err(ended) = self.send_report(client, &request).await
+                    {
+                        return ended;
+                    }
+                }
                 // The reader task ends when the connection is closed.
                 _ = &mut *reader => return Ended::Lost,
             }
@@ -250,16 +291,67 @@ impl Station<'_> {
     /// and the next connection reports everything again.
     async fn report_all(&mut self, client: &Client) -> Result<(), Ended> {
         for request in status16::report(self.started, &self.connectors) {
-            match client.call(&request).await {
-                Ok(_) => self.backoff.reset(),
-                Err(CallFailure::Disconnected) => return Err(Ended::Lost),
-                Err(err) => eprintln!(
-                    "StatusNotification for connector {} failed: {err}",
-                    request.connector_id
-                ),
-            }
+            self.send_report(client, &request).await?;
         }
         Ok(())
+    }
+
+    /// One StatusNotification. A success resets the back-off; a failure that
+    /// leaves the connection up is logged, not retried (roadmap backlog).
+    async fn send_report(
+        &mut self,
+        client: &Client,
+        request: &StatusNotificationRequest,
+    ) -> Result<(), Ended> {
+        match client.call(request).await {
+            Ok(_) => self.backoff.reset(),
+            Err(CallFailure::Disconnected) => return Err(Ended::Lost),
+            Err(err) => eprintln!(
+                "StatusNotification for connector {} failed: {err}",
+                request.connector_id
+            ),
+        }
+        Ok(())
+    }
+
+    /// Applies the events that arrived before now, in order, without
+    /// reporting them one by one. A closed channel ends the source.
+    fn apply_queued(&mut self) {
+        while let Some(receiver) = &mut self.inputs {
+            match receiver.try_recv() {
+                Ok(input) => {
+                    self.apply(input);
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => self.inputs = None,
+            }
+        }
+    }
+
+    /// Applies one input to the connector. On a state change the connector
+    /// is stamped with the instant of the input and the request to report it
+    /// is returned. An event that does not fit the state is printed and
+    /// changes nothing.
+    fn apply(&mut self, input: Input) -> Option<StatusNotificationRequest> {
+        let connector = self.connectors.first_mut()?;
+        match connector.state.on(input.event) {
+            Ok(state) => {
+                println!(
+                    "connector {}: {:?} -> {:?}",
+                    connector.id, connector.state, state
+                );
+                connector.state = state;
+                connector.since = input.at;
+                Some(status16::status_notification(connector.id, state, input.at))
+            }
+            Err(invalid) => {
+                eprintln!(
+                    "connector {}: {:?} does not fit {:?}, ignored",
+                    connector.id, invalid.event, invalid.state
+                );
+                None
+            }
+        }
     }
 }
 
@@ -297,7 +389,9 @@ async fn disconnect(
 mod tests {
     use super::*;
     use crate::{
+        connector::{Event as ConnectorEvent, Fault},
         frame::Frame,
+        keyboard::Input,
         test_support::{Event, FakeCsms, echo_ocpp16},
     };
     use futures_util::StreamExt;
@@ -355,10 +449,29 @@ mod tests {
         settings: Settings,
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> JoinHandle<()> {
+        // The sender is dropped at once: a closed channel, like stdin at EOF.
+        let (_inputs_tx, inputs) = mpsc::channel(8);
+        spawn_run_with(url, settings, inputs, shutdown)
+    }
+
+    fn spawn_run_with(
+        url: &str,
+        settings: Settings,
+        inputs: mpsc::Receiver<Input>,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> JoinHandle<()> {
         let url = url.to_owned();
         tokio::spawn(async move {
-            run(&url, settings, &boot_request(), STARTED, shutdown).await;
+            run(&url, settings, &boot_request(), STARTED, inputs, shutdown).await;
         })
+    }
+
+    /// Runs the charge point with an open input channel; keep the sender
+    /// alive for as long as the channel should stay open.
+    fn spawn_run_inputs(url: &str, settings: Settings) -> (mpsc::Sender<Input>, JoinHandle<()>) {
+        let (inputs_tx, inputs) = mpsc::channel(8);
+        let cp = spawn_run_with(url, settings, inputs, std::future::pending());
+        (inputs_tx, cp)
     }
 
     /// A shutdown signal for `run`: send on the sender to stop. Dropping
@@ -786,6 +899,173 @@ mod tests {
         answer_reports(&mut csms).await;
     }
 
+    // --- Keyboard inputs ---
+
+    /// 2026-11-05T12:00:00Z, the instant of the first input in the tests.
+    const T0: i64 = 1_793_880_000;
+
+    fn input(event: ConnectorEvent, unix: i64) -> Input {
+        Input {
+            event,
+            at: UtcDateTime::from_unix_timestamp(unix).unwrap(),
+        }
+    }
+
+    fn report_at(
+        connector_id: u32,
+        status: &str,
+        error_code: &str,
+        timestamp: &str,
+    ) -> serde_json::Value {
+        json!({
+            "connectorId": connector_id,
+            "errorCode": error_code,
+            "status": status,
+            "timestamp": timestamp,
+        })
+    }
+
+    /// The next StatusNotification must carry `expected`; answers it.
+    async fn expect_report(csms: &mut FakeCsms, expected: serde_json::Value) {
+        let (id, payload) = recv_report(csms).await;
+        assert_eq!(payload, expected);
+        csms.send(empty_result(&id));
+    }
+
+    #[tokio::test]
+    async fn input_sends_status_notification() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+
+        inputs
+            .send(input(ConnectorEvent::PlugIn, T0))
+            .await
+            .unwrap();
+
+        // The time of the input, not the time of the report.
+        let preparing = report_at(1, "Preparing", "NoError", "2026-11-05T12:00:00Z");
+        expect_report(&mut csms, preparing).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_event_sends_nothing() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+
+        // Charging cannot start while Available: no message, no change.
+        inputs
+            .send(input(ConnectorEvent::StartCharging, T0))
+            .await
+            .unwrap();
+        inputs
+            .send(input(ConnectorEvent::PlugIn, T0 + 60))
+            .await
+            .unwrap();
+
+        // The first report is the one for the valid event, still from Available.
+        let preparing = report_at(1, "Preparing", "NoError", "2026-11-05T12:01:00Z");
+        expect_report(&mut csms, preparing).await;
+    }
+
+    #[tokio::test]
+    async fn fault_reports_the_error_code_and_clear_returns_to_the_pre_fault_state() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+
+        let steps = [
+            (ConnectorEvent::PlugIn, "Preparing", "NoError"),
+            (ConnectorEvent::StartCharging, "Charging", "NoError"),
+            (
+                ConnectorEvent::Fault(Fault::OverCurrent),
+                "Faulted",
+                "OverCurrentFailure",
+            ),
+            (ConnectorEvent::ClearFault, "Charging", "NoError"),
+        ];
+        for (n, (event, status, error_code)) in steps.into_iter().enumerate() {
+            let unix = T0 + 60 * n as i64;
+            inputs.send(input(event, unix)).await.unwrap();
+            let (id, payload) = recv_report(&mut csms).await;
+            assert_eq!(payload["connectorId"], 1);
+            assert_eq!(payload["status"], status, "step {n}");
+            assert_eq!(payload["errorCode"], error_code, "step {n}");
+            csms.send(empty_result(&id));
+        }
+    }
+
+    #[tokio::test]
+    async fn inputs_wait_until_boot_is_accepted() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        assert!(matches!(csms.recv_event().await, Event::Connected));
+        let id = call_id(csms.recv_event().await, "BootNotification");
+        inputs
+            .send(input(ConnectorEvent::PlugIn, T0))
+            .await
+            .unwrap();
+        csms.send(boot_result(&id, "Pending", 1));
+
+        // Nothing but BootNotification while Pending (section 4.2).
+        let id = call_id(
+            csms.recv_event_within(HEARTBEAT_WAIT).await,
+            "BootNotification",
+        );
+        csms.send(boot_result(&id, "Accepted", 1));
+
+        // The waiting input is applied first: one report with the final status.
+        expect_report(&mut csms, report_payload(0)).await;
+        let preparing = report_at(1, "Preparing", "NoError", "2026-11-05T12:00:00Z");
+        expect_report(&mut csms, preparing).await;
+    }
+
+    #[tokio::test]
+    async fn inputs_while_offline_are_reported_once_with_the_time_of_the_last_one() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+
+        csms.close_connection();
+        assert!(matches!(csms.recv_event().await, Event::Closed { .. }));
+        // The client is in its back-off wait now (MIN, much longer than this).
+        sleep(Duration::from_millis(50)).await;
+        inputs
+            .send(input(ConnectorEvent::PlugIn, T0))
+            .await
+            .unwrap();
+        inputs
+            .send(input(ConnectorEvent::StartCharging, T0 + 60))
+            .await
+            .unwrap();
+        assert!(matches!(
+            csms.recv_event_within(LONG).await,
+            Event::Connected
+        ));
+
+        // No notification per event: connector 0, then connector 1 with the
+        // final status and the time of the last input, then the Heartbeat.
+        expect_report(&mut csms, report_payload(0)).await;
+        let charging = report_at(1, "Charging", "NoError", "2026-11-05T12:01:00Z");
+        expect_report(&mut csms, charging).await;
+        call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
+    }
+
+    #[tokio::test]
+    async fn heartbeats_continue_after_the_sender_is_dropped() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+
+        // Like stdin at end of file: the keyboard is gone, the station stays.
+        drop(inputs);
+        for _ in 0..2 {
+            let id = call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
+            csms.send(heartbeat_result(&id));
+        }
+    }
+
     // --- Failed Heartbeat ---
 
     #[tokio::test]
@@ -871,6 +1151,28 @@ mod tests {
         let (stop, signal) = shutdown_signal();
         let cp = spawn_run_until(&csms.url, settings(LONG), signal);
         accept_boot(&mut csms).await;
+        recv_report(&mut csms).await; // never answered
+
+        stop.send(()).unwrap();
+        let took = time_to_stop(cp).await;
+        assert!(
+            took < Duration::from_secs(1),
+            "waited for the call: {took:?}"
+        );
+        assert_closed_with(&mut csms, 1001).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_status_notification_closes_connection() {
+        let mut csms = FakeCsms::start().await;
+        let (stop, signal) = shutdown_signal();
+        let (inputs_tx, inputs) = mpsc::channel(8);
+        let cp = spawn_run_with(&csms.url, settings(LONG), inputs, signal);
+        connect_and_accept(&mut csms).await;
+        inputs_tx
+            .send(input(ConnectorEvent::PlugIn, T0))
+            .await
+            .unwrap();
         recv_report(&mut csms).await; // never answered
 
         stop.send(()).unwrap();
