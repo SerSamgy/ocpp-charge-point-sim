@@ -62,7 +62,9 @@ impl Request for HeartbeatRequest {
 // --- StatusNotification ---
 
 /// Only `connector_id`, `error_code` and `status` are required by the
-/// schema. `timestamp` stays empty for now: the CSMS uses its receive time.
+/// schema. `timestamp` is the time the status was reached, in UTC and whole
+/// seconds (see `timestamp`); when it is absent the CSMS assumes the time of
+/// receipt.
 #[cfg_attr(not(test), expect(dead_code, reason = "wired into session in step 4b"))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
