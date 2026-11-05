@@ -24,6 +24,7 @@ use crate::{
 };
 
 /// The one connector of the simulated charge point.
+// The `unwrap` runs at compile time, and 1 is not zero, so it cannot panic.
 const CONNECTOR_ID: NonZeroU32 = NonZeroU32::new(1).unwrap();
 
 #[derive(Debug, Clone, Copy)]
