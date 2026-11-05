@@ -50,6 +50,7 @@ instead.
            BootNotification (errata 3.22). Each report carries the instant
            the status was reached. First check of StatusNotification
            from the Rust client against `just csms`.
+           [#14](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/14)
      - [ ] **4b-2.** Keyboard events (`plug`, `start`, `stop`, `unplug`,
            `fault <kind>`, `clear`) from stdin on a thread of its own,
            stamped with the time of the key press; StatusNotification on
@@ -123,7 +124,8 @@ Found during the migration inventory; carried over as is
 - [ ] `read_loop` logs every received Close as "server closed
       connection", also when it is the server's reply to our own Close.
 - [x] After a reconnect without BootNotification, send StatusNotification
-      for every connector again. Done in step 4b-1.
+      for every connector again. Done in step 4b-1,
+      [#14](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/14).
 - [ ] Retry a StatusNotification that failed on a live connection
       (timeout, CALLERROR): today it is logged and the CSMS may stay out
       of date until the next reconnect re-reports everything.
