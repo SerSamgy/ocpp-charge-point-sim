@@ -334,6 +334,10 @@ impl Station<'_> {
     /// is stamped with the instant of the input and the request to report it
     /// is returned. An event that does not fit the state is printed and
     /// changes nothing.
+    #[expect(
+        clippy::print_stderr,
+        reason = "replies to what the owner types, not log events: a log filter must not hide them"
+    )]
     fn apply(&mut self, input: Input) -> Option<StatusNotificationRequest> {
         let connector = self.connectors.first_mut()?;
         match connector.state.on(input.event) {

@@ -6,6 +6,9 @@
 //! `ws://localhost:9000/CP001`. The map of the modules and their
 //! invariants is `docs/architecture.md`.
 
+// Output goes through `tracing`; see `logging`.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 mod backoff;
 mod boot;
 mod client;
