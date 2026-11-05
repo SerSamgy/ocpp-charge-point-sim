@@ -11,7 +11,7 @@ use std::{
     io::{self, IsTerminal},
 };
 
-use tracing_subscriber::{EnvFilter, filter::ParseError};
+use tracing_subscriber::EnvFilter;
 
 use crate::client::BoxError;
 
@@ -21,11 +21,13 @@ const DEFAULT_FILTER: &str = "cp_sim=debug";
 /// Builds the filter from the value of `RUST_LOG`. Unset and blank mean the
 /// default; a value that does not parse is an error, so that a typo does not
 /// silently turn the log off.
-fn env_filter(rust_log: Option<&str>) -> Result<EnvFilter, ParseError> {
-    match rust_log.map(str::trim) {
-        None | Some("") => EnvFilter::try_new(DEFAULT_FILTER),
-        Some(directives) => EnvFilter::try_new(directives),
-    }
+fn env_filter(rust_log: Option<&str>) -> Result<EnvFilter, BoxError> {
+    let directives = match rust_log.map(str::trim) {
+        None | Some("") => DEFAULT_FILTER,
+        Some(directives) => directives,
+    };
+    EnvFilter::try_new(directives)
+        .map_err(|err| format!("RUST_LOG={directives:?} does not parse: {err}").into())
 }
 
 /// Installs the global subscriber. Call it first in `main`: events emitted
@@ -79,6 +81,7 @@ mod tests {
 
     #[test]
     fn malformed_directives_are_an_error() {
-        assert!(env_filter(Some("cp_sim=loud")).is_err());
+        let err = env_filter(Some("cp_sim=loud")).unwrap_err();
+        assert!(err.to_string().contains("cp_sim=loud"), "{err}");
     }
 }
