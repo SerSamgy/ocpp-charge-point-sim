@@ -11,9 +11,14 @@
 //! (the station has been offline for a long time), the keyboard thread waits
 //! and stops reading lines until the session takes the inputs.
 
-use std::fmt;
+use std::{
+    fmt,
+    io::{self, BufRead, IsTerminal},
+    thread,
+};
 
 use time::UtcDateTime;
+use tokio::sync::mpsc;
 
 use crate::connector::{Event, Fault};
 
@@ -51,6 +56,74 @@ impl fmt::Display for ParseError {
     }
 }
 
+/// Starts the keyboard on a thread of its own and returns at once.
+///
+/// Not `tokio::io::stdin`: a pending read of that sits in Tokio's blocking
+/// pool, and dropping the runtime waits for blocking tasks, so after Ctrl+C
+/// the program would hang until the user pressed Enter. A plain thread that
+/// is never joined dies with the process. The thread ends at end of file, on
+/// a read error, or when the session has dropped the receiver.
+pub fn spawn(inputs: mpsc::Sender<Input>) -> io::Result<()> {
+    thread::Builder::new()
+        .name("keyboard".into())
+        .spawn(move || {
+            let stdin = io::stdin();
+            if stdin.is_terminal() {
+                eprintln!("{HELP}");
+            }
+            read_inputs(stdin.lock(), &inputs, UtcDateTime::now);
+            eprintln!("keyboard input ended; the station keeps running without it");
+        })?;
+    Ok(())
+}
+
+/// Reads lines from `reader` and sends the commands as inputs stamped with
+/// `now()`, the instant the line arrived. A bad line prints a message and
+/// reading goes on, also when the line is not valid UTF-8 (the bytes of it
+/// are consumed, so there is no loop); any other read error ends it, because
+/// a failing input would fail again at once. `blocking_send` waits when the
+/// channel is full. Returns at end of file, on a read error, or when the
+/// receiver is gone.
+fn read_inputs(
+    mut reader: impl BufRead,
+    inputs: &mpsc::Sender<Input>,
+    now: impl Fn() -> UtcDateTime,
+) {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                eprintln!("that line is not valid UTF-8, ignored");
+                continue;
+            }
+            Err(err) => {
+                eprintln!("cannot read the keyboard: {err}");
+                return;
+            }
+        }
+        let text = line.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if text.eq_ignore_ascii_case("help") {
+            eprintln!("{HELP}");
+            continue;
+        }
+        match parse(text) {
+            Ok(event) => {
+                let input = Input { event, at: now() };
+                if inputs.blocking_send(input).is_err() {
+                    return;
+                }
+            }
+            Err(err) => eprintln!("{err}"),
+        }
+    }
+}
+
 /// One command per line, case-insensitive, extra whitespace ignored.
 pub fn parse(line: &str) -> Result<Event, ParseError> {
     let lowered = line.to_lowercase();
@@ -82,7 +155,120 @@ fn fault(kind: &str) -> Result<Fault, ParseError> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
+
+    const T0: UtcDateTime = UtcDateTime::UNIX_EPOCH;
+
+    /// Runs `read_inputs` over `bytes` and returns what it sent.
+    fn read_all(bytes: &[u8]) -> Vec<Input> {
+        let (tx, mut rx) = mpsc::channel(16);
+        read_inputs(Cursor::new(bytes.to_vec()), &tx, || T0);
+        drop(tx);
+        let mut inputs = Vec::new();
+        while let Some(input) = rx.blocking_recv() {
+            inputs.push(input);
+        }
+        inputs
+    }
+
+    #[test]
+    fn lines_become_inputs_stamped_with_the_clock() {
+        let inputs = read_all(b"plug\nstart\n");
+        assert_eq!(
+            inputs,
+            [
+                Input {
+                    event: Event::PlugIn,
+                    at: T0
+                },
+                Input {
+                    event: Event::StartCharging,
+                    at: T0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn bad_empty_and_help_lines_send_nothing_and_reading_goes_on() {
+        let inputs = read_all(b"fly\n\n   \nhelp\nfault\nunplug\n");
+        assert_eq!(
+            inputs,
+            [Input {
+                event: Event::Unplug,
+                at: T0
+            }]
+        );
+    }
+
+    #[test]
+    fn a_line_without_a_final_newline_still_counts() {
+        assert_eq!(read_all(b"clear").len(), 1);
+    }
+
+    #[test]
+    fn a_line_that_is_not_utf8_is_skipped_and_reading_goes_on() {
+        let inputs = read_all(b"plug\n\xff\xfe\nstop\n");
+        let events: Vec<Event> = inputs.iter().map(|i| i.event).collect();
+        assert_eq!(events, [Event::PlugIn, Event::StopCharging]);
+    }
+
+    /// A reader whose every read fails.
+    struct Broken;
+
+    impl io::Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("broken"))
+        }
+    }
+
+    impl BufRead for Broken {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Err(io::Error::other("broken"))
+        }
+        fn consume(&mut self, _: usize) {}
+    }
+
+    #[test]
+    fn a_read_error_ends_the_reader() {
+        let (tx, _rx) = mpsc::channel(1);
+        // Returns instead of looping forever.
+        read_inputs(Broken, &tx, || T0);
+    }
+
+    /// A reader that offers the line `plug` `left` times, then end of file.
+    struct Plugs {
+        left: usize,
+    }
+
+    impl io::Read for Plugs {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            unreachable!("read_line goes through fill_buf")
+        }
+    }
+
+    impl BufRead for Plugs {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Ok(if self.left == 0 { b"" } else { b"plug\n" })
+        }
+        fn consume(&mut self, amount: usize) {
+            if amount > 0 {
+                self.left -= 1;
+            }
+        }
+    }
+
+    #[test]
+    fn a_dropped_receiver_ends_the_reader_after_the_first_line() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let mut plugs = Plugs { left: 5 };
+        read_inputs(&mut plugs, &tx, || T0);
+        // One line was read and could not be sent; the reader stopped there.
+        assert_eq!(plugs.left, 4);
+    }
 
     #[test]
     fn simple_commands() {

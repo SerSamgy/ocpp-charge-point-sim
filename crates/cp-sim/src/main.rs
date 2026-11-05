@@ -9,10 +9,8 @@
 mod backoff;
 mod boot;
 mod client;
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into session in step 4b"))]
 mod connector;
 mod frame;
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into main in step 4b-2"))]
 mod keyboard;
 mod ocpp16;
 mod pending;
@@ -66,8 +64,9 @@ async fn main() -> Result<(), client::BoxError> {
         charge_point_serial_number: None,
         firmware_version: None,
     };
-    // No keyboard yet: the sender stays here, so the channel stays open.
-    let (_inputs_tx, inputs) = tokio::sync::mpsc::channel(32);
+    // Room for a few commands typed while the station is offline.
+    let (inputs_tx, inputs) = tokio::sync::mpsc::channel(32);
+    keyboard::spawn(inputs_tx)?;
     session::run(
         &url,
         SETTINGS,
