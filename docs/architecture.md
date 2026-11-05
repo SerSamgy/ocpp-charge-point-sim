@@ -11,7 +11,7 @@ structure (crates, modules, message flow, invariants) updates this page.
 |---|---|
 | `crates/cp-sim` | The charge point: an OCPP-J client over WebSocket, Tokio runtime. One binary. |
 | `crates/cp-blink` | GPIO experiments on the Pi (`rppal`): LED, buttons, debouncing. Standalone binaries, not used by `cp-sim` yet (roadmap step 8). Pins: `docs/hardware/`. |
-| `csms/` | Python test CSMS on the `ocpp` library. Answers BootNotification (status sequence and interval configurable through `BOOT_STATUSES`, `BOOT_INTERVAL`) and Heartbeat; logs the close code of a disconnected charge point. |
+| `csms/` | Python test CSMS on the `ocpp` library. Answers BootNotification (status sequence and interval configurable through `BOOT_STATUSES`, `BOOT_INTERVAL`), Heartbeat and StatusNotification (logged, empty result); logs the close code of a disconnected charge point. |
 
 ## Modules of `cp-sim`
 
@@ -20,10 +20,12 @@ Layered from the wire up; each module uses only the ones above it.
 | Module | Responsibility | Depends on the OCPP version? |
 |---|---|---|
 | `frame` | OCPP-J RPC frame: CALL, CALLRESULT, CALLERROR as a JSON array. | No, same in 1.6 and 2.0.1. |
+| `connector` | The state of one connector (Available, Preparing, Charging, Finishing, Faulted) and the events that change it; a pure state machine following the table of 1.6 section 4.9. Not used by `session` yet (step 4b). | No: the state is our own enum, not the 1.6 wire status. |
 | `ocpp16` | OCPP 1.6 payloads; the `Request` trait ties a payload to its action name and response type. | Yes. |
 | `pending` | `PendingCalls`: outstanding CALLs by message ID, each waiting on a `oneshot` channel. | No. |
 | `client` | One WebSocket connection: `Client::call` sends a typed request and waits for the typed answer; the reader task routes incoming frames; `Client::close` sends a Close frame with a status code. | Partly: sub-protocol `ocpp1.6`, `ocpp16::Request`. |
 | `boot` | Maps a BootNotification response to the next step (Accepted, Pending, Rejected). | Yes, 1.6 section 4.2. |
+| `status16` | Maps a connector state to a 1.6 StatusNotification request; connector 0 is not representable. Not used by `session` yet (step 4b). | Yes, through `connector` and `ocpp16`. |
 | `backoff` | Wait before a reconnect, OCPP-J 2.0.1 part 4 section 5.4. | No, a transport rule. |
 | `session` | Stays connected until a shutdown signal: connect, boot until Accepted, Heartbeat, reconnect; on the signal, close the connection and return. Owns the state that survives a connection (`Station`). | Yes, through `boot` and `ocpp16`. |
 | `main` | Reads the CSMS URL, rejects a malformed one, fixes the settings, runs `session::run` until Ctrl+C or SIGTERM. | Boot payload is 1.6. |
@@ -88,6 +90,8 @@ does not check that a test still means what the row says; review does.
 | `disconnect` never awaits a reader task that was already awaited to the end (that panics). | `session::disconnect_after_reader_was_awaited_does_not_panic` |
 | Shutdown ends within `close_timeout` even if the server never answers the Close. The timeout also covers sending the Close; a send that hangs on a full socket buffer is not tested, as a small Close frame always fits into the kernel buffer. | `session::shutdown_gives_up_after_close_timeout` |
 | Closing a connection that is already closing is not an error; a Close from the server gets a Close in reply (RFC 6455 section 5.5.1). | `client::second_close_is_ok`, `client::close_after_server_closed_is_ok` |
+| A connector makes only the transitions of the 1.6 table (section 4.9); a fault returns to the pre-fault state. | `connector::no_transition_outside_the_16_table`, `connector::fault_from_every_state_remembers_it_and_clear_fault_resumes` |
+| An event that does not fit the state is returned as an error and leaves the state unchanged. | `connector::invalid_events_leave_state_unchanged` |
 | The client offers sub-protocol `ocpp1.6` in the handshake. | None yet: the fake CSMS answers `ocpp1.6` without looking at the request. Backlog. |
 | A malformed or non-`ws(s)://` URL stops the program at startup instead of being retried forever. | None yet: the check lives in `main`. Backlog. |
 
@@ -104,4 +108,7 @@ earlier attempt is kept in `docs/archive/`), add a `v201` message module
 beside `v16`, let the version pick the sub-protocol, and give `session`
 a per-version boot and status logic. Behaviour that differs between
 versions (for example `boot::next_step`, which follows 1.6 section 4.2)
-belongs to the version module, not to `session`.
+belongs to the version module, not to `session`. The same goes for
+`status16`: 2.0.1 gets its own mapping from the shared `connector` state
+(Preparing, Charging and Finishing become `Occupied`), and `boot` and
+`status16` move into the version module.
