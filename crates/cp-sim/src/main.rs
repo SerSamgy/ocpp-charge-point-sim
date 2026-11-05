@@ -19,6 +19,8 @@ mod session;
 mod status16;
 #[cfg(test)]
 mod test_support;
+#[cfg_attr(not(test), expect(dead_code, reason = "wired into session in step 4b"))]
+mod timestamp;
 
 use std::{io, time::Duration};
 
