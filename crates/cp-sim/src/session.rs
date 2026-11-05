@@ -1,9 +1,13 @@
 //! Staying connected to the CSMS: connect, BootNotification until Accepted,
-//! Heartbeat, and reconnect with back-off whenever the connection is lost.
+//! report the status of the charge point and its connector, Heartbeat, and
+//! reconnect with back-off whenever the connection is lost. After every
+//! Accepted and after every reconnect that skips the boot, the status is
+//! reported again (OCPP 1.6 errata 3.22).
 
-use std::time::Duration;
+use std::{num::NonZeroU32, time::Duration};
 
 use rand::rngs::StdRng;
+use time::UtcDateTime;
 use tokio::{
     task::JoinHandle,
     time::{MissedTickBehavior, interval, sleep, timeout},
@@ -14,8 +18,13 @@ use crate::{
     backoff::{Backoff, BackoffConfig},
     boot::{self, BootStep},
     client::{CallFailure, Client, Timeouts},
+    connector::Connector,
     ocpp16::{BootNotificationRequest, HeartbeatRequest},
+    status16,
 };
+
+/// The one connector of the simulated charge point.
+const CONNECTOR_ID: NonZeroU32 = NonZeroU32::new(1).unwrap();
 
 #[derive(Debug, Clone, Copy)]
 pub struct Settings {
@@ -35,6 +44,12 @@ pub struct Settings {
 /// - BootNotification until Accepted; after that, reconnects skip it, as
 ///   OCPP-J section 5.4 recommends (1.6 and 2.0.1 alike): our boot data
 ///   never changes while the program runs.
+/// - After Accepted, and after every reconnect that skips the boot, report
+///   connector 0 and the connector with their current status (errata 3.22).
+///   `started` is the time of the program start: the instant every status
+///   was reached so far. It is fixed for the whole run, so a Pi that starts
+///   before NTP has synchronised reports that wrong time until a restart
+///   (roadmap backlog, "Trust in `timestamp`").
 /// - A failed CALL that leaves the connection up is logged and retried.
 /// - On `shutdown`: close an open connection with 1001 Going Away (RFC 6455
 ///   section 7.4.1) and return within `close_timeout`; a CALL in flight is
@@ -43,6 +58,7 @@ pub async fn run(
     url: &str,
     settings: Settings,
     request: &BootNotificationRequest,
+    started: UtcDateTime,
     shutdown: impl Future<Output = ()>,
 ) {
     // `select!` polls `shutdown` by `&mut` in several places, and a future
@@ -52,6 +68,8 @@ pub async fn run(
         settings,
         request,
         heartbeat: None,
+        started,
+        connectors: vec![Connector::new(CONNECTOR_ID, started)],
         backoff: Backoff::new(settings.backoff),
         // `StdRng` is `Send`, unlike `rand::rng()`, so the future of `run`
         // can move between Tokio worker threads.
@@ -121,6 +139,9 @@ struct Station<'a> {
     request: &'a BootNotificationRequest,
     /// Heartbeat interval from the last Accepted boot; `None` until then.
     heartbeat: Option<Duration>,
+    /// When the program started; the time of the status of connector 0.
+    started: UtcDateTime,
+    connectors: Vec<Connector>,
     backoff: Backoff,
     rng: StdRng,
 }
@@ -185,10 +206,14 @@ impl Station<'_> {
         }
     }
 
-    /// Sends Heartbeat every `every` until the connection is lost.
-    /// A failed Heartbeat is logged; the next one goes out on schedule.
-    /// `every` is never zero (`boot::next_step` replaces 0 with a default),
-    /// so `interval` does not panic.
+    /// Reports the status, then sends Heartbeat every `every` until the
+    /// connection is lost. A failed Heartbeat is logged; the next one goes
+    /// out on schedule. `every` is never zero (`boot::next_step` replaces 0
+    /// with a default), so `interval` does not panic.
+    ///
+    /// The ticker starts before the reports, so the Heartbeat cadence counts
+    /// from the moment the connection became usable, and slow reports
+    /// (each may wait up to the call timeout) do not push it further out.
     async fn keep_alive(
         &mut self,
         client: &Client,
@@ -200,6 +225,9 @@ impl Station<'_> {
         // ticks in a burst; just start counting again.
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         ticker.tick().await; // first tick completes immediately — skip it
+        if let Err(ended) = self.report_all(client).await {
+            return ended;
+        }
         loop {
             tokio::select! {
                 _ = ticker.tick() => match client.call(&HeartbeatRequest {}).await {
@@ -211,6 +239,26 @@ impl Station<'_> {
                 _ = &mut *reader => return Ended::Lost,
             }
         }
+    }
+
+    /// Sends the status of connector 0 and of every connector, in the order
+    /// `status16::report` gives (OCPP 1.6 errata 3.22: after Accepted; and
+    /// after a reconnect, section 4.9). A success resets the back-off: after
+    /// a reconnect without boot this is the first exchange. A failed report
+    /// is logged and the next one still goes out; a lost connection is `Err`,
+    /// and the next connection reports everything again.
+    async fn report_all(&mut self, client: &Client) -> Result<(), Ended> {
+        for request in status16::report(self.started, &self.connectors) {
+            match client.call(&request).await {
+                Ok(_) => self.backoff.reset(),
+                Err(CallFailure::Disconnected) => return Err(Ended::Lost),
+                Err(err) => eprintln!(
+                    "StatusNotification for connector {} failed: {err}",
+                    request.connector_id
+                ),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -307,7 +355,9 @@ mod tests {
         shutdown: impl Future<Output = ()> + Send + 'static,
     ) -> JoinHandle<()> {
         let url = url.to_owned();
-        tokio::spawn(async move { run(&url, settings, &boot_request(), shutdown).await })
+        tokio::spawn(async move {
+            run(&url, settings, &boot_request(), STARTED, shutdown).await;
+        })
     }
 
     /// A shutdown signal for `run`: send on the sender to stop. Dropping
@@ -376,12 +426,64 @@ mod tests {
         }
     }
 
+    /// The fixed program start of the tests: the time of every report.
+    const STARTED: UtcDateTime = UtcDateTime::UNIX_EPOCH;
+    const STARTED_TEXT: &str = "1970-01-01T00:00:00Z";
+
     /// Takes the client through a first connection and an Accepted boot
-    /// with a 1 s heartbeat.
-    async fn connect_and_accept(csms: &mut FakeCsms) {
+    /// with a 1 s heartbeat; leaves the reports that follow unanswered.
+    /// Returns the instant the Accepted answer was sent.
+    async fn accept_boot(csms: &mut FakeCsms) -> Instant {
         assert!(matches!(csms.recv_event().await, Event::Connected));
         let id = call_id(csms.recv_event().await, "BootNotification");
         csms.send(boot_result(&id, "Accepted", 1));
+        Instant::now()
+    }
+
+    /// `accept_boot`, then answers the two reports (see `answer_reports`).
+    async fn connect_and_accept(csms: &mut FakeCsms) -> Instant {
+        let accepted = accept_boot(csms).await;
+        answer_reports(csms).await;
+        accepted
+    }
+
+    /// The next event must be a StatusNotification CALL; returns its ID and
+    /// payload.
+    async fn recv_report(csms: &mut FakeCsms) -> (String, serde_json::Value) {
+        match csms.recv_event().await {
+            Event::Frame(Frame::Call {
+                id,
+                action,
+                payload,
+            }) if action == "StatusNotification" => (id, payload),
+            other => panic!("expected a StatusNotification CALL, got {other:?}"),
+        }
+    }
+
+    fn report_payload(connector_id: u32) -> serde_json::Value {
+        json!({
+            "connectorId": connector_id,
+            "errorCode": "NoError",
+            "status": "Available",
+            "timestamp": STARTED_TEXT,
+        })
+    }
+
+    fn empty_result(id: &str) -> Frame {
+        Frame::CallResult {
+            id: id.into(),
+            payload: json!({}),
+        }
+    }
+
+    /// Receives the two reports that follow Accepted (connector 0, then
+    /// connector 1), checks them and answers each with an empty result.
+    async fn answer_reports(csms: &mut FakeCsms) {
+        for connector_id in [0, 1] {
+            let (id, payload) = recv_report(csms).await;
+            assert_eq!(payload, report_payload(connector_id));
+            csms.send(empty_result(&id));
+        }
     }
 
     /// Waits for the client to come back after `Event::Closed`; returns how
@@ -403,8 +505,7 @@ mod tests {
         let mut csms = FakeCsms::start().await;
         let _cp = spawn_run(&csms.url, settings(LONG));
 
-        connect_and_accept(&mut csms).await;
-        let accepted = Instant::now();
+        let accepted = connect_and_accept(&mut csms).await;
 
         call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
         assert!(
@@ -494,7 +595,9 @@ mod tests {
         let gap = reconnect_gap(&mut csms).await;
         assert!(gap >= MIN, "reconnected before the back-off: {gap:?}");
 
-        // Section 5.4: no BootNotification, just carry on with Heartbeat.
+        // Section 5.4: no BootNotification, just report and carry on with
+        // Heartbeat.
+        answer_reports(&mut csms).await;
         call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
     }
 
@@ -565,12 +668,121 @@ mod tests {
 
         let id = call_id(csms.recv_event().await, "BootNotification");
         csms.send(boot_result(&id, "Accepted", 1));
-        // The boot response is through before the server closes.
-        call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
+        // The first report proves that the boot response arrived. It is left
+        // unanswered on purpose: an answer to a report resets the back-off
+        // too, and this test is about the boot response.
+        recv_report(&mut csms).await;
         csms.close_connection();
 
         let gap = reconnect_gap(&mut csms).await;
         assert!(gap < 2 * MIN, "back-off was not reset: {gap:?}");
+    }
+
+    // --- Status reports ---
+
+    #[tokio::test]
+    async fn accepted_reports_connector_0_then_1() {
+        let mut csms = FakeCsms::start().await;
+        let _cp = spawn_run(&csms.url, settings(LONG));
+        accept_boot(&mut csms).await;
+
+        // Connector 0 first, then connector 1, both with the fixed start time,
+        // and both before the first Heartbeat.
+        answer_reports(&mut csms).await;
+        call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
+    }
+
+    #[tokio::test]
+    async fn reconnect_without_boot_reports_both_again() {
+        let mut csms = FakeCsms::start().await;
+        let _cp = spawn_run(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+
+        csms.close_connection();
+        reconnect_gap(&mut csms).await;
+
+        // The same payloads, with the same time: a report that took the
+        // current time instead of the time the status was reached would differ.
+        answer_reports(&mut csms).await;
+    }
+
+    #[tokio::test]
+    async fn pending_boot_sends_no_report() {
+        let mut csms = FakeCsms::start().await;
+        let _cp = spawn_run(&csms.url, settings(LONG));
+
+        assert!(matches!(csms.recv_event().await, Event::Connected));
+        let id = call_id(csms.recv_event().await, "BootNotification");
+        csms.send(boot_result(&id, "Pending", 1));
+
+        // Only BootNotification until the CSMS accepts (section 4.2).
+        let id = call_id(
+            csms.recv_event_within(HEARTBEAT_WAIT).await,
+            "BootNotification",
+        );
+        csms.send(boot_result(&id, "Accepted", 1));
+        answer_reports(&mut csms).await;
+    }
+
+    #[tokio::test]
+    async fn successful_report_resets_backoff() {
+        let mut csms = FakeCsms::start().await;
+        let _cp = spawn_run(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+
+        // One failure, so the next wait would be 2 · MIN without a reset.
+        csms.close_connection();
+        reconnect_gap(&mut csms).await;
+        // This reconnect skips the boot: the answers to the reports are the
+        // first exchange on this connection.
+        answer_reports(&mut csms).await;
+        csms.close_connection();
+
+        let gap = reconnect_gap(&mut csms).await;
+        assert!(gap < 2 * MIN, "back-off was not reset: {gap:?}");
+    }
+
+    #[tokio::test]
+    async fn report_call_error_keeps_connection() {
+        let mut csms = FakeCsms::start().await;
+        let _cp = spawn_run(&csms.url, settings(LONG));
+        accept_boot(&mut csms).await;
+
+        let (id, _) = recv_report(&mut csms).await;
+        csms.send(call_error(&id));
+        // The next event is the report of connector 1 on the same connection.
+        let (id, payload) = recv_report(&mut csms).await;
+        assert_eq!(payload, report_payload(1));
+        csms.send(empty_result(&id));
+        call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
+    }
+
+    #[tokio::test]
+    async fn report_timeout_keeps_connection() {
+        let mut csms = FakeCsms::start().await;
+        let _cp = spawn_run(&csms.url, settings(SHORT));
+        accept_boot(&mut csms).await;
+
+        // Connector 0 is never answered: the call times out after SHORT.
+        recv_report(&mut csms).await;
+        let (id, payload) = recv_report(&mut csms).await;
+        assert_eq!(payload, report_payload(1));
+        csms.send(empty_result(&id));
+        call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
+    }
+
+    #[tokio::test]
+    async fn connection_lost_during_report_reports_again() {
+        let mut csms = FakeCsms::start().await;
+        let _cp = spawn_run(&csms.url, settings(LONG));
+        accept_boot(&mut csms).await;
+
+        recv_report(&mut csms).await; // connector 0, never answered
+        csms.close_connection();
+        reconnect_gap(&mut csms).await;
+
+        // Nothing is lost: the new connection reports everything.
+        answer_reports(&mut csms).await;
     }
 
     // --- Failed Heartbeat ---
@@ -642,6 +854,23 @@ mod tests {
         let cp = spawn_run_until(&csms.url, settings(LONG), signal);
         connect_and_accept(&mut csms).await;
         call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat"); // never answered
+
+        stop.send(()).unwrap();
+        let took = time_to_stop(cp).await;
+        assert!(
+            took < Duration::from_secs(1),
+            "waited for the call: {took:?}"
+        );
+        assert_closed_with(&mut csms, 1001).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_report_closes_connection() {
+        let mut csms = FakeCsms::start().await;
+        let (stop, signal) = shutdown_signal();
+        let cp = spawn_run_until(&csms.url, settings(LONG), signal);
+        accept_boot(&mut csms).await;
+        recv_report(&mut csms).await; // never answered
 
         stop.send(()).unwrap();
         let took = time_to_stop(cp).await;

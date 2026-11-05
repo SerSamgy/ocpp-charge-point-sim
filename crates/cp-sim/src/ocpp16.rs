@@ -65,7 +65,6 @@ impl Request for HeartbeatRequest {
 /// schema. `timestamp` is the time the status was reached, in UTC and whole
 /// seconds (see `timestamp`); when it is absent the CSMS assumes the time of
 /// receipt.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into session in step 4b"))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusNotificationRequest {
@@ -82,13 +81,11 @@ pub struct StatusNotificationRequest {
     pub vendor_error_code: Option<String>,
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into session in step 4b"))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StatusNotificationResponse {}
 
 /// Every status of the schema, although the connector state machine uses
 /// only some of them so far.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into session in step 4b"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChargePointStatus {
     Available,
@@ -103,7 +100,6 @@ pub enum ChargePointStatus {
 }
 
 /// Every error code of the schema.
-#[cfg_attr(not(test), expect(dead_code, reason = "wired into session in step 4b"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChargePointErrorCode {
     ConnectorLockFailure,
