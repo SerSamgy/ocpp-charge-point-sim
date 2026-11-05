@@ -59,6 +59,14 @@ class ChargePoint(cp):
     def on_heartbeat(self):
         return call_result.Heartbeat(current_time=now_iso())
 
+    @on(Action.status_notification)
+    def on_status_notification(self, connector_id, error_code, status, **kwargs):
+        logger.info(
+            f"StatusNotification from {self.id}: connector={connector_id} "
+            f"status={status} error_code={error_code}"
+        )
+        return call_result.StatusNotification()
+
 
 async def on_connect(websocket):
     """Called for every new websocket connection."""
