@@ -63,6 +63,7 @@ instead.
          unplug with StopTransaction, DeAuthorized stop (errata 3.17), an
          undelivered StopTransaction kept and retried (`pending_stop`), CSMS
          handlers.
+         [#17](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/17)
    - [ ] **5b.** Periodic MeterValues during a transaction
          (`MeterValueSampleInterval`, errata 3.15); decide on
          `transactionData` in StopTransaction (errata 3.14).
