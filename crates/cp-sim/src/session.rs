@@ -5,7 +5,8 @@
 //! reported again (OCPP 1.6 errata 3.22). Commands from the keyboard change
 //! the state of the connector; each one on a live connection is reported at
 //! once. `start` presents an idTag and begins a transaction when the CSMS
-//! accepts it (Authorize, StartTransaction).
+//! accepts it (Authorize, StartTransaction); `stop` and unplugging the
+//! cable while charging end it (StopTransaction).
 
 use std::{num::NonZeroU32, time::Duration};
 
@@ -26,9 +27,12 @@ use crate::{
     connector::{Connector, Event, State},
     keyboard::{Command, Input},
     meter::Meter,
-    ocpp16::{BootNotificationRequest, HeartbeatRequest, StatusNotificationRequest},
+    ocpp16::{
+        BootNotificationRequest, HeartbeatRequest, StatusNotificationRequest,
+        StopTransactionRequest,
+    },
     status16,
-    transaction16::{self, IdTag, Transaction},
+    transaction16::{self, IdTag, StartDecision, StopCause, Transaction},
 };
 
 /// The one connector of the simulated charge point.
@@ -89,6 +93,7 @@ pub async fn run(
         connectors: vec![Connector::new(CONNECTOR_ID, started)],
         meter: Meter::new(),
         transaction: None,
+        pending_stop: None,
         inputs: Some(inputs),
         backoff: Backoff::new(settings.backoff),
         // `StdRng` is `Send`, unlike `rand::rng()`, so the future of `run`
@@ -167,6 +172,11 @@ struct Station<'a> {
     /// The transaction on the connector, once the CSMS has answered
     /// StartTransaction. It survives a lost connection.
     transaction: Option<Transaction>,
+    /// The StopTransaction of an ended transaction until the CSMS has
+    /// answered it. The transaction ends on the station at once; the
+    /// message is transaction-related and must reach the CSMS (section
+    /// 3.7), so it waits here across lost connections and failed CALLs.
+    pending_stop: Option<StopTransactionRequest>,
     /// Keyboard events; `None` once the sender is gone (stdin closed), so a
     /// closed channel is never polled again.
     inputs: Option<mpsc::Receiver<Input>>,
@@ -268,18 +278,33 @@ impl Station<'_> {
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         ticker.tick().await; // first tick completes immediately — skip it
         // Events that waited for this moment are applied first, so the
-        // report below shows the final status.
+        // report below shows the final status. A transaction that ended
+        // meanwhile, or whose StopTransaction did not get through, is
+        // reported before the statuses: transaction-related messages go
+        // out in order and as soon as possible (section 3.7).
         self.apply_queued();
+        if let Err(ended) = self.send_pending_stop(client).await {
+            return ended;
+        }
         if let Err(ended) = self.report_all(client).await {
             return ended;
         }
         loop {
             tokio::select! {
-                _ = ticker.tick() => match client.call(&HeartbeatRequest {}).await {
-                    Ok(_) => self.backoff.reset(),
-                    Err(CallFailure::Disconnected) => return Ended::Lost,
-                    Err(err) => warn!(%err, "Heartbeat failed"),
-                },
+                _ = ticker.tick() => {
+                    match client.call(&HeartbeatRequest {}).await {
+                        Ok(_) => self.backoff.reset(),
+                        Err(CallFailure::Disconnected) => return Ended::Lost,
+                        Err(err) => warn!(%err, "Heartbeat failed"),
+                    }
+                    // A StopTransaction that failed on this connection is
+                    // tried again on every tick, whatever became of the
+                    // Heartbeat: a CSMS that fails Heartbeats must not stop
+                    // it for good. Attempt limits and waits: step 5c.
+                    if let Err(ended) = self.send_pending_stop(client).await {
+                        return ended;
+                    }
+                }
                 // `select!` drops the other futures before it runs a handler,
                 // so the handler may use `self` again.
                 input = next_input(&mut self.inputs) => {
@@ -325,6 +350,25 @@ impl Station<'_> {
         Ok(())
     }
 
+    /// Sends the waiting StopTransaction, if any, and forgets it once the
+    /// CSMS has answered. A failure that leaves the connection up is
+    /// logged; the message stays and goes out again later.
+    async fn send_pending_stop(&mut self, client: &Client) -> Result<(), Ended> {
+        let Some(request) = &self.pending_stop else {
+            return Ok(());
+        };
+        let transaction_id = request.transaction_id;
+        match client.call(request).await {
+            Ok(_) => {
+                self.backoff.reset();
+                self.pending_stop = None;
+            }
+            Err(CallFailure::Disconnected) => return Err(Ended::Lost),
+            Err(err) => warn!(transaction_id, %err, "StopTransaction failed, will retry"),
+        }
+        Ok(())
+    }
+
     /// Applies the inputs that arrived before now, in order, without
     /// reporting them one by one. A closed channel ends the source.
     ///
@@ -363,16 +407,28 @@ impl Station<'_> {
                 let Some(event) = event(&command) else {
                     return Ok(());
                 };
-                match self.apply(event, input.at) {
-                    Some(report) => self.send_report(client, &report).await,
-                    None => Ok(()),
+                // At most one StopTransaction waits: a new transaction
+                // cannot start before it is delivered.
+                let had_stop = self.pending_stop.is_some();
+                let Some(report) = self.apply(event, input.at) else {
+                    return Ok(());
+                };
+                // The transaction ended before the status changed: send
+                // StopTransaction first. Its failure is logged and the
+                // status still goes out, so the CSMS does not see a
+                // Charging connector until the next reconnect.
+                if !had_stop && self.pending_stop.is_some() {
+                    self.send_pending_stop(client).await?;
                 }
+                self.send_report(client, &report).await
             }
         }
     }
 
     /// `start`: the user presents `text` as an idTag at `at`. Only in
-    /// Preparing (cable plugged in) and without an open transaction.
+    /// Preparing (cable plugged in) and once the StopTransaction of the
+    /// previous transaction is delivered, so the CSMS gets the transactions
+    /// in order (section 3.7).
     /// Authorize, then StartTransaction; once the CSMS has answered it, the
     /// transaction exists and the connector starts charging. Anything that
     /// goes wrong before that answer leaves the connector in Preparing and
@@ -397,6 +453,13 @@ impl Station<'_> {
             eprintln!(
                 "connector {id}: transaction {} is still open, ignored",
                 open.id
+            );
+            return Ok(());
+        }
+        if let Some(stop) = &self.pending_stop {
+            eprintln!(
+                "the end of transaction {} has not reached the CSMS yet, ignored",
+                stop.transaction_id
             );
             return Ok(());
         }
@@ -445,6 +508,11 @@ impl Station<'_> {
             }
         };
 
+        // From here to the first `await` below, everything is applied at
+        // once: the transaction, Charging, and, if the CSMS does not accept
+        // the idTag, the stop. A connection lost while the reports go out
+        // then cannot leave a transaction running that should have stopped;
+        // the next connection sends the waiting StopTransaction first.
         info!(
             transaction_id = response.transaction_id,
             id_tag = %id_tag,
@@ -456,17 +524,61 @@ impl Station<'_> {
             id_tag,
             meter_start,
         });
-        match self.apply(Event::StartCharging, at) {
-            Some(report) => self.send_report(client, &report).await,
-            None => Ok(()),
+        let charging = self.apply(Event::StartCharging, at);
+        let stopped = match transaction16::on_start_conf(&response) {
+            StartDecision::Charge => None,
+            StartDecision::StopDeAuthorized => {
+                eprintln!(
+                    "the CSMS did not accept the idTag in StartTransaction ({:?}): \
+                     transaction {} stopped",
+                    response.id_tag_info.status, response.transaction_id
+                );
+                self.end_transaction(StopCause::DeAuthorized, at);
+                Some(self.apply(Event::StopCharging, at))
+            }
+        };
+
+        // Errata 3.17 stops the transaction "normally": the CSMS sees it
+        // start (Charging), then StopTransaction, then Finishing.
+        if let Some(report) = charging {
+            self.send_report(client, &report).await?;
         }
+        if let Some(finishing) = stopped {
+            self.send_pending_stop(client).await?;
+            if let Some(report) = finishing {
+                self.send_report(client, &report).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends the open transaction at `at`, if there is one: the station
+    /// stops it at once and keeps its StopTransaction until the CSMS has
+    /// answered (`pending_stop`).
+    fn end_transaction(&mut self, cause: StopCause, at: UtcDateTime) {
+        let Some(transaction) = self.transaction.take() else {
+            return;
+        };
+        let meter_stop = self.meter.reading(at);
+        let request = transaction16::stop(&transaction, cause, meter_stop, at);
+        info!(
+            transaction_id = transaction.id,
+            meter_stop,
+            energy_wh = meter_stop.saturating_sub(transaction.meter_start),
+            reason = ?request.reason,
+            "transaction stopped"
+        );
+        self.pending_stop = Some(request);
     }
 
     /// Applies one event to the connector at `at`. On a state change the
     /// connector is stamped with `at`, the meter runs exactly while the
     /// connector is Charging, and the request to report the new state is
-    /// returned. An event that does not fit the state is printed and
-    /// changes nothing.
+    /// returned. Leaving Charging for Finishing (`stop`) or Available
+    /// (unplugged, `StopTransactionOnEVSideDisconnect`) ends the
+    /// transaction; a fault does not, and clearing it resumes charging in
+    /// the same transaction. An event that does not fit the state is
+    /// printed and changes nothing.
     #[expect(
         clippy::print_stderr,
         reason = "replies to what the owner types, not log events: a log filter must not hide them"
@@ -484,13 +596,22 @@ impl Station<'_> {
                 );
                 connector.state = state;
                 connector.since = at;
+                let report = status16::status_notification(connector.id, state, at);
                 match (before, state) {
                     (State::Charging, State::Charging) => {}
                     (_, State::Charging) => self.meter.start(at),
+                    (State::Charging, State::Finishing) => {
+                        self.meter.stop(at);
+                        self.end_transaction(StopCause::Local, at);
+                    }
+                    (State::Charging, State::Available) => {
+                        self.meter.stop(at);
+                        self.end_transaction(StopCause::EvDisconnected, at);
+                    }
                     (State::Charging, _) => self.meter.stop(at),
                     _ => {}
                 }
-                Some(status16::status_notification(connector.id, state, at))
+                Some(report)
             }
             Err(invalid) => {
                 eprintln!(
@@ -1413,30 +1534,277 @@ mod tests {
         call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
     }
 
+    /// The StopTransaction of `start_charging`'s transaction: meter at
+    /// `meter_stop`, stopped at `T0 + offset`; `id_tag` and `reason` as
+    /// they should appear (absent when `None`).
+    fn stop_payload(
+        meter_stop: u64,
+        offset: i64,
+        id_tag: Option<&str>,
+        reason: Option<&str>,
+    ) -> serde_json::Value {
+        let mut payload = json!({
+            "meterStop": meter_stop,
+            "timestamp": wire_time(offset),
+            "transactionId": TX,
+        });
+        if let Some(id_tag) = id_tag {
+            payload["idTag"] = json!(id_tag);
+        }
+        if let Some(reason) = reason {
+            payload["reason"] = json!(reason);
+        }
+        payload
+    }
+
+    /// The next frame must be a StopTransaction carrying `expected`;
+    /// returns its ID, unanswered.
+    async fn recv_stop(csms: &mut FakeCsms, expected: serde_json::Value) -> String {
+        let (id, payload) = recv_call(csms, "StopTransaction").await;
+        assert_eq!(payload, expected);
+        id
+    }
+
+    /// 7400 W for 120 s: 246.67 Wh, read as 246.
+    const WH_120_S: u64 = 246;
+
     #[tokio::test]
-    async fn start_while_a_transaction_is_open_is_ignored() {
+    async fn stop_ends_the_transaction_with_the_meter_reading() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs).await; // charging since T0 + 60
+
+        inputs.send(input(Command::Stop, T0 + 180)).await.unwrap();
+        // A stop by the user: the idTag that started it, no reason (Local).
+        let expected = stop_payload(WH_120_S, 180, Some(TAG), None);
+        let id = recv_stop(&mut csms, expected).await;
+        csms.send(empty_result(&id));
+        let finishing = report_at(1, "Finishing", "NoError", &wire_time(180));
+        expect_report(&mut csms, finishing).await;
+    }
+
+    #[tokio::test]
+    async fn unplug_while_charging_ends_the_transaction_as_ev_disconnected() {
         let mut csms = FakeCsms::start().await;
         let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
         connect_and_accept(&mut csms).await;
         start_charging(&mut csms, &inputs).await;
 
-        // Back to Preparing through a fault and a clear would resume
-        // Charging, so go through Finishing and Available instead.
-        let steps = [
-            (Command::Stop, "Finishing"),
-            (Command::Unplug, "Available"),
-            (Command::Plug, "Preparing"),
-        ];
+        inputs.send(input(Command::Unplug, T0 + 180)).await.unwrap();
+        let expected = stop_payload(WH_120_S, 180, None, Some("EVDisconnected"));
+        let id = recv_stop(&mut csms, expected).await;
+        csms.send(empty_result(&id));
+        let available = report_at(1, "Available", "NoError", &wire_time(180));
+        expect_report(&mut csms, available).await;
+    }
+
+    #[tokio::test]
+    async fn a_fault_keeps_the_transaction_and_its_time_is_not_charged() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs).await; // charging since T0 + 60
+
+        // 60 s charging, 180 s faulted, 60 s charging: 120 s of energy.
+        let fault = input(Command::Fault(Fault::OverCurrent), T0 + 120);
+        inputs.send(fault).await.unwrap();
+        let faulted = report_at(1, "Faulted", "OverCurrentFailure", &wire_time(120));
+        expect_report(&mut csms, faulted).await;
+        inputs.send(input(Command::Clear, T0 + 300)).await.unwrap();
+        let charging = report_at(1, "Charging", "NoError", &wire_time(300));
+        expect_report(&mut csms, charging).await;
+
+        inputs.send(input(Command::Stop, T0 + 360)).await.unwrap();
+        let expected = stop_payload(WH_120_S, 360, Some(TAG), None);
+        let id = recv_stop(&mut csms, expected).await;
+        csms.send(empty_result(&id));
+    }
+
+    /// `plug` and `start`, and the CSMS answers StartTransaction with
+    /// Blocked. Returns once the StartTransaction answer is sent.
+    async fn start_refused_in_start_transaction(csms: &mut FakeCsms, inputs: &mpsc::Sender<Input>) {
+        plug_in(csms, inputs).await;
+        inputs.send(present(TAG, T0 + 60)).await.unwrap();
+        let (id, _) = recv_call(csms, "Authorize").await;
+        csms.send(authorize_result(&id, "Accepted"));
+        let (id, _) = recv_call(csms, "StartTransaction").await;
+        csms.send(start_result(&id, "Blocked"));
+    }
+
+    #[tokio::test]
+    async fn a_start_conf_not_accepted_stops_the_transaction_as_deauthorized() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        start_refused_in_start_transaction(&mut csms, &inputs).await;
+
+        // Errata 3.17: the transaction exists and is stopped normally, at
+        // the same instant, so no energy flowed.
+        let charging = report_at(1, "Charging", "NoError", &wire_time(60));
+        expect_report(&mut csms, charging).await;
+        let expected = stop_payload(0, 60, None, Some("DeAuthorized"));
+        let id = recv_stop(&mut csms, expected).await;
+        csms.send(empty_result(&id));
+        let finishing = report_at(1, "Finishing", "NoError", &wire_time(60));
+        expect_report(&mut csms, finishing).await;
+    }
+
+    #[tokio::test]
+    async fn connection_lost_after_a_deauthorized_start_still_stops_the_transaction() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        start_refused_in_start_transaction(&mut csms, &inputs).await;
+
+        recv_report(&mut csms).await; // Charging, never answered
+        csms.close_connection();
+        reconnect_gap(&mut csms).await;
+
+        // The stop was applied before the reports went out: the waiting
+        // StopTransaction goes first, then the reports show Finishing.
+        let expected = stop_payload(0, 60, None, Some("DeAuthorized"));
+        let id = recv_stop(&mut csms, expected).await;
+        csms.send(empty_result(&id));
+        expect_report(&mut csms, report_payload(0)).await;
+        let finishing = report_at(1, "Finishing", "NoError", &wire_time(60));
+        expect_report(&mut csms, finishing).await;
+    }
+
+    #[tokio::test]
+    async fn the_transaction_survives_a_reconnect() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs).await;
+
+        csms.close_connection();
+        reconnect_gap(&mut csms).await;
+        expect_report(&mut csms, report_payload(0)).await;
+        let charging = report_at(1, "Charging", "NoError", &wire_time(60));
+        expect_report(&mut csms, charging).await;
+
+        // The same transaction ID, and the meter kept running.
+        inputs.send(input(Command::Stop, T0 + 180)).await.unwrap();
+        let expected = stop_payload(WH_120_S, 180, Some(TAG), None);
+        recv_stop(&mut csms, expected).await;
+    }
+
+    #[tokio::test]
+    async fn stop_while_offline_is_sent_first_after_the_reconnect() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs).await;
+
+        csms.close_connection();
+        assert!(matches!(csms.recv_event().await, Event::Closed { .. }));
+        sleep(Duration::from_millis(50)).await;
+        inputs.send(input(Command::Stop, T0 + 180)).await.unwrap();
+        assert!(matches!(
+            csms.recv_event_within(LONG).await,
+            Event::Connected
+        ));
+
+        // Section 3.7: the transaction-related message first, with the
+        // time of `stop`, then the reports.
+        let expected = stop_payload(WH_120_S, 180, Some(TAG), None);
+        let id = recv_stop(&mut csms, expected).await;
+        csms.send(empty_result(&id));
+        expect_report(&mut csms, report_payload(0)).await;
+        let finishing = report_at(1, "Finishing", "NoError", &wire_time(180));
+        expect_report(&mut csms, finishing).await;
+    }
+
+    #[tokio::test]
+    async fn connection_lost_during_stop_transaction_sends_it_again() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs).await;
+
+        inputs.send(input(Command::Stop, T0 + 180)).await.unwrap();
+        let expected = stop_payload(WH_120_S, 180, Some(TAG), None);
+        recv_stop(&mut csms, expected.clone()).await; // never answered
+        csms.close_connection();
+        reconnect_gap(&mut csms).await;
+
+        let id = recv_stop(&mut csms, expected).await;
+        csms.send(empty_result(&id));
+        expect_report(&mut csms, report_payload(0)).await;
+        let finishing = report_at(1, "Finishing", "NoError", &wire_time(180));
+        expect_report(&mut csms, finishing).await;
+    }
+
+    /// `stop`, with StopTransaction failing as `failure`: the status still
+    /// goes out at once, and the StopTransaction again after the next
+    /// Heartbeat, answered as `heartbeat` says.
+    async fn failed_stop_is_retried(failure: Failure, heartbeat_fails: bool) {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(SHORT));
+        connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs).await;
+
+        inputs.send(input(Command::Stop, T0 + 180)).await.unwrap();
+        let expected = stop_payload(WH_120_S, 180, Some(TAG), None);
+        let id = recv_stop(&mut csms, expected.clone()).await;
+        if let Failure::CallError = failure {
+            csms.send(call_error(&id));
+        } // else never answered: the call times out after SHORT
+        let finishing = report_at(1, "Finishing", "NoError", &wire_time(180));
+        expect_report(&mut csms, finishing).await;
+
+        let id = call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
+        csms.send(if heartbeat_fails {
+            call_error(&id)
+        } else {
+            heartbeat_result(&id)
+        });
+        let id = recv_stop(&mut csms, expected).await;
+        csms.send(empty_result(&id));
+    }
+
+    #[tokio::test]
+    async fn stop_transaction_call_error_is_retried_after_the_heartbeat() {
+        failed_stop_is_retried(Failure::CallError, false).await;
+    }
+
+    #[tokio::test]
+    async fn stop_transaction_timeout_is_retried_after_the_heartbeat() {
+        failed_stop_is_retried(Failure::Timeout, false).await;
+    }
+
+    #[tokio::test]
+    async fn stop_transaction_is_retried_even_when_the_heartbeat_fails() {
+        failed_stop_is_retried(Failure::CallError, true).await;
+    }
+
+    #[tokio::test]
+    async fn start_is_refused_until_the_stop_is_delivered() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs).await;
+
+        inputs.send(input(Command::Stop, T0 + 180)).await.unwrap();
+        let id = recv_stop(&mut csms, stop_payload(WH_120_S, 180, Some(TAG), None)).await;
+        csms.send(call_error(&id));
+        let finishing = report_at(1, "Finishing", "NoError", &wire_time(180));
+        expect_report(&mut csms, finishing).await;
+        // Back to Preparing, with the StopTransaction still waiting.
+        let steps = [(Command::Unplug, "Available"), (Command::Plug, "Preparing")];
         for (n, (command, status)) in steps.into_iter().enumerate() {
-            let unix = T0 + 120 + 60 * n as i64;
+            let unix = T0 + 240 + 60 * n as i64;
             inputs.send(input(command, unix)).await.unwrap();
             let (id, payload) = recv_report(&mut csms).await;
             assert_eq!(payload["status"], status, "step {n}");
             csms.send(empty_result(&id));
         }
-        inputs.send(present(TAG, T0 + 300)).await.unwrap();
-        inputs.send(input(Command::Unplug, T0 + 360)).await.unwrap();
-        let available = report_at(1, "Available", "NoError", &wire_time(360));
+
+        // No Authorize: the next frame is the report of the next command.
+        inputs.send(present(TAG, T0 + 360)).await.unwrap();
+        inputs.send(input(Command::Unplug, T0 + 420)).await.unwrap();
+        let available = report_at(1, "Available", "NoError", &wire_time(420));
         expect_report(&mut csms, available).await;
     }
 
@@ -1546,6 +1914,30 @@ mod tests {
         let line = text.lines().find(|l| l.contains("transaction started"));
         let line = line.unwrap_or_else(|| panic!("no transaction start in the log:\n{text}"));
         for field in ["transaction_id=7", "id_tag=Card-42", "meter_start=0"] {
+            assert!(line.contains(field), "{field} missing in: {line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stopped_transaction_is_logged_with_its_fields() {
+        let logs = LogCapture::start(EnvFilter::new("cp_sim=info"));
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs).await;
+        inputs.send(input(Command::Unplug, T0 + 180)).await.unwrap();
+        recv_call(&mut csms, "StopTransaction").await;
+
+        let text = logs.text();
+        let line = text.lines().find(|l| l.contains("transaction stopped"));
+        let line = line.unwrap_or_else(|| panic!("no transaction stop in the log:\n{text}"));
+        let fields = [
+            "transaction_id=7",
+            "meter_stop=246",
+            "energy_wh=246",
+            "reason=Some(EVDisconnected)",
+        ];
+        for field in fields {
             assert!(line.contains(field), "{field} missing in: {line}");
         }
     }
@@ -1697,6 +2089,29 @@ mod tests {
     #[tokio::test]
     async fn shutdown_during_start_transaction_closes_connection() {
         shutdown_during_start("StartTransaction").await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_stop_transaction_closes_connection() {
+        let mut csms = FakeCsms::start().await;
+        let (stop, signal) = shutdown_signal();
+        let (inputs_tx, inputs) = mpsc::channel(8);
+        let cp = spawn_run_with(&csms.url, settings(LONG), inputs, signal);
+        connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs_tx).await;
+        inputs_tx
+            .send(input(Command::Stop, T0 + 180))
+            .await
+            .unwrap();
+        recv_call(&mut csms, "StopTransaction").await; // never answered
+
+        stop.send(()).unwrap();
+        let took = time_to_stop(cp).await;
+        assert!(
+            took < Duration::from_secs(1),
+            "waited for the call: {took:?}"
+        );
+        assert_closed_with(&mut csms, 1001).await;
     }
 
     #[tokio::test]

@@ -17,10 +17,6 @@ mod frame;
 mod keyboard;
 mod logging;
 mod meter;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "StopTransaction is sent from the next commit on")
-)]
 mod ocpp16;
 mod pending;
 mod session;
@@ -28,10 +24,6 @@ mod status16;
 #[cfg(test)]
 mod test_support;
 mod timestamp;
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "StopTransaction is sent from the next commit on")
-)]
 mod transaction16;
 
 use std::{io, time::Duration};
