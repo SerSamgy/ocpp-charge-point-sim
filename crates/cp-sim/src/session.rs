@@ -21,8 +21,8 @@ use crate::{
     backoff::{Backoff, BackoffConfig},
     boot::{self, BootStep},
     client::{CallFailure, Client, Timeouts},
-    connector::Connector,
-    keyboard::Input,
+    connector::{Connector, Event},
+    keyboard::{Command, Input},
     ocpp16::{BootNotificationRequest, HeartbeatRequest, StatusNotificationRequest},
     status16,
 };
@@ -340,7 +340,7 @@ impl Station<'_> {
     )]
     fn apply(&mut self, input: Input) -> Option<StatusNotificationRequest> {
         let connector = self.connectors.first_mut()?;
-        match connector.state.on(input.event) {
+        match connector.state.on(event(input.command)) {
             Ok(state) => {
                 info!(
                     connector = connector.id,
@@ -360,6 +360,18 @@ impl Station<'_> {
                 None
             }
         }
+    }
+}
+
+/// The connector event a keyboard command stands for.
+fn event(command: Command) -> Event {
+    match command {
+        Command::Plug => Event::PlugIn,
+        Command::Start => Event::StartCharging,
+        Command::Stop => Event::StopCharging,
+        Command::Unplug => Event::Unplug,
+        Command::Fault(fault) => Event::Fault(fault),
+        Command::Clear => Event::ClearFault,
     }
 }
 
@@ -397,9 +409,9 @@ async fn disconnect(
 mod tests {
     use super::*;
     use crate::{
-        connector::{Event as ConnectorEvent, Fault},
+        connector::Fault,
         frame::Frame,
-        keyboard::Input,
+        keyboard::{Command, Input},
         test_support::{Event, FakeCsms, LogCapture, echo_ocpp16},
     };
     use futures_util::StreamExt;
@@ -913,9 +925,9 @@ mod tests {
     /// 2026-11-05T12:00:00Z, the instant of the first input in the tests.
     const T0: i64 = 1_793_880_000;
 
-    fn input(event: ConnectorEvent, unix: i64) -> Input {
+    fn input(command: Command, unix: i64) -> Input {
         Input {
-            event,
+            command,
             at: UtcDateTime::from_unix_timestamp(unix).unwrap(),
         }
     }
@@ -947,10 +959,7 @@ mod tests {
         let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
         connect_and_accept(&mut csms).await;
 
-        inputs
-            .send(input(ConnectorEvent::PlugIn, T0))
-            .await
-            .unwrap();
+        inputs.send(input(Command::Plug, T0)).await.unwrap();
 
         // The time of the input, not the time of the report.
         let preparing = report_at(1, "Preparing", "NoError", "2026-11-05T12:00:00Z");
@@ -964,10 +973,7 @@ mod tests {
         let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
         connect_and_accept(&mut csms).await;
 
-        inputs
-            .send(input(ConnectorEvent::PlugIn, T0))
-            .await
-            .unwrap();
+        inputs.send(input(Command::Plug, T0)).await.unwrap();
         let preparing = report_at(1, "Preparing", "NoError", "2026-11-05T12:00:00Z");
         expect_report(&mut csms, preparing).await;
 
@@ -986,14 +992,8 @@ mod tests {
         connect_and_accept(&mut csms).await;
 
         // Charging cannot start while Available: no message, no change.
-        inputs
-            .send(input(ConnectorEvent::StartCharging, T0))
-            .await
-            .unwrap();
-        inputs
-            .send(input(ConnectorEvent::PlugIn, T0 + 60))
-            .await
-            .unwrap();
+        inputs.send(input(Command::Start, T0)).await.unwrap();
+        inputs.send(input(Command::Plug, T0 + 60)).await.unwrap();
 
         // The first report is the one for the valid event, still from Available.
         let preparing = report_at(1, "Preparing", "NoError", "2026-11-05T12:01:00Z");
@@ -1007,14 +1007,14 @@ mod tests {
         connect_and_accept(&mut csms).await;
 
         let steps = [
-            (ConnectorEvent::PlugIn, "Preparing", "NoError"),
-            (ConnectorEvent::StartCharging, "Charging", "NoError"),
+            (Command::Plug, "Preparing", "NoError"),
+            (Command::Start, "Charging", "NoError"),
             (
-                ConnectorEvent::Fault(Fault::OverCurrent),
+                Command::Fault(Fault::OverCurrent),
                 "Faulted",
                 "OverCurrentFailure",
             ),
-            (ConnectorEvent::ClearFault, "Charging", "NoError"),
+            (Command::Clear, "Charging", "NoError"),
         ];
         for (n, (event, status, error_code)) in steps.into_iter().enumerate() {
             let unix = T0 + 60 * n as i64;
@@ -1033,10 +1033,7 @@ mod tests {
         let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
         assert!(matches!(csms.recv_event().await, Event::Connected));
         let id = call_id(csms.recv_event().await, "BootNotification");
-        inputs
-            .send(input(ConnectorEvent::PlugIn, T0))
-            .await
-            .unwrap();
+        inputs.send(input(Command::Plug, T0)).await.unwrap();
         csms.send(boot_result(&id, "Pending", 1));
 
         // Nothing but BootNotification while Pending (section 4.2).
@@ -1062,14 +1059,8 @@ mod tests {
         assert!(matches!(csms.recv_event().await, Event::Closed { .. }));
         // The client is in its back-off wait now (MIN, much longer than this).
         sleep(Duration::from_millis(50)).await;
-        inputs
-            .send(input(ConnectorEvent::PlugIn, T0))
-            .await
-            .unwrap();
-        inputs
-            .send(input(ConnectorEvent::StartCharging, T0 + 60))
-            .await
-            .unwrap();
+        inputs.send(input(Command::Plug, T0)).await.unwrap();
+        inputs.send(input(Command::Start, T0 + 60)).await.unwrap();
         assert!(matches!(
             csms.recv_event_within(LONG).await,
             Event::Connected
@@ -1089,10 +1080,7 @@ mod tests {
         let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
         connect_and_accept(&mut csms).await;
 
-        inputs
-            .send(input(ConnectorEvent::PlugIn, T0))
-            .await
-            .unwrap();
+        inputs.send(input(Command::Plug, T0)).await.unwrap();
         recv_report(&mut csms).await; // never answered
         csms.close_connection();
         reconnect_gap(&mut csms).await;
@@ -1221,10 +1209,7 @@ mod tests {
         let (inputs_tx, inputs) = mpsc::channel(8);
         let cp = spawn_run_with(&csms.url, settings(LONG), inputs, signal);
         connect_and_accept(&mut csms).await;
-        inputs_tx
-            .send(input(ConnectorEvent::PlugIn, T0))
-            .await
-            .unwrap();
+        inputs_tx.send(input(Command::Plug, T0)).await.unwrap();
         recv_report(&mut csms).await; // never answered
 
         stop.send(()).unwrap();

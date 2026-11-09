@@ -1,8 +1,10 @@
-//! Commands typed on the keyboard, as connector events.
+//! Commands typed on the keyboard.
 //!
 //! Until buttons exist (roadmap step 8), the keyboard plays the plug, the
 //! card reader and the fault detector. This module only turns a line of
-//! text into an `Event`; reading stdin is a separate, thin piece of I/O.
+//! text into a `Command`; reading stdin is a separate, thin piece of I/O.
+//! A command says what the user did; `session` decides what it means for
+//! the connector.
 //!
 //! Limitations: a command is checked against the state of the connector
 //! only when the session applies it, which happens after the station has
@@ -21,18 +23,35 @@ use time::UtcDateTime;
 use tokio::sync::mpsc;
 use tracing::warn;
 
-use crate::connector::{Event, Fault};
+use crate::connector::Fault;
 
 /// Printed by the `help` command and when stdin is a terminal.
 pub const HELP: &str = "commands: plug, start, stop, unplug, clear, fault <kind>, help\n\
                         fault kinds: ground, overcurrent, overvoltage, undervoltage, temperature, other";
 
-/// An event with the instant the user typed it. The instant is the time the
-/// connector reaches its new status, even if the station applies the event
+/// What the user did at the charge point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    /// `plug`: the cable is inserted.
+    Plug,
+    /// `start`: charging starts.
+    Start,
+    /// `stop`: charging stops, the cable stays plugged in.
+    Stop,
+    /// `unplug`: the cable is removed.
+    Unplug,
+    /// `fault <kind>`: a fault is detected.
+    Fault(Fault),
+    /// `clear`: the fault is gone.
+    Clear,
+}
+
+/// A command with the instant the user typed it. The instant is the time the
+/// connector reaches its new status, even if the station applies the command
 /// later, after a reconnect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Input {
-    pub event: Event,
+    pub command: Command,
     pub at: UtcDateTime,
 }
 
@@ -122,8 +141,8 @@ fn read_inputs(
             continue;
         }
         match parse(text) {
-            Ok(event) => {
-                let input = Input { event, at: now() };
+            Ok(command) => {
+                let input = Input { command, at: now() };
                 if inputs.blocking_send(input).is_err() {
                     return;
                 }
@@ -134,18 +153,18 @@ fn read_inputs(
 }
 
 /// One command per line, case-insensitive, extra whitespace ignored.
-pub fn parse(line: &str) -> Result<Event, ParseError> {
+pub fn parse(line: &str) -> Result<Command, ParseError> {
     let lowered = line.to_lowercase();
     let words: Vec<&str> = lowered.split_whitespace().collect();
     match words.as_slice() {
         [] => Err(ParseError::Empty),
-        ["plug"] => Ok(Event::PlugIn),
-        ["start"] => Ok(Event::StartCharging),
-        ["stop"] => Ok(Event::StopCharging),
-        ["unplug"] => Ok(Event::Unplug),
-        ["clear"] => Ok(Event::ClearFault),
+        ["plug"] => Ok(Command::Plug),
+        ["start"] => Ok(Command::Start),
+        ["stop"] => Ok(Command::Stop),
+        ["unplug"] => Ok(Command::Unplug),
+        ["clear"] => Ok(Command::Clear),
         ["fault"] => Err(ParseError::MissingFaultKind),
-        ["fault", kind] => fault(kind).map(Event::Fault),
+        ["fault", kind] => fault(kind).map(Command::Fault),
         _ => Err(ParseError::Unknown(words.join(" "))),
     }
 }
@@ -189,11 +208,11 @@ mod tests {
             inputs,
             [
                 Input {
-                    event: Event::PlugIn,
+                    command: Command::Plug,
                     at: T0
                 },
                 Input {
-                    event: Event::StartCharging,
+                    command: Command::Start,
                     at: T0
                 },
             ]
@@ -206,7 +225,7 @@ mod tests {
         assert_eq!(
             inputs,
             [Input {
-                event: Event::Unplug,
+                command: Command::Unplug,
                 at: T0
             }]
         );
@@ -220,8 +239,8 @@ mod tests {
     #[test]
     fn a_line_that_is_not_utf8_is_skipped_and_reading_goes_on() {
         let inputs = read_all(b"plug\n\xff\xfe\nstop\n");
-        let events: Vec<Event> = inputs.iter().map(|i| i.event).collect();
-        assert_eq!(events, [Event::PlugIn, Event::StopCharging]);
+        let commands: Vec<Command> = inputs.iter().map(|i| i.command).collect();
+        assert_eq!(commands, [Command::Plug, Command::Stop]);
     }
 
     /// A reader whose every read fails.
@@ -281,20 +300,20 @@ mod tests {
 
     #[test]
     fn simple_commands() {
-        assert_eq!(parse("plug"), Ok(Event::PlugIn));
-        assert_eq!(parse("start"), Ok(Event::StartCharging));
-        assert_eq!(parse("stop"), Ok(Event::StopCharging));
-        assert_eq!(parse("unplug"), Ok(Event::Unplug));
-        assert_eq!(parse("clear"), Ok(Event::ClearFault));
+        assert_eq!(parse("plug"), Ok(Command::Plug));
+        assert_eq!(parse("start"), Ok(Command::Start));
+        assert_eq!(parse("stop"), Ok(Command::Stop));
+        assert_eq!(parse("unplug"), Ok(Command::Unplug));
+        assert_eq!(parse("clear"), Ok(Command::Clear));
     }
 
     #[test]
     fn case_and_whitespace_do_not_matter() {
-        assert_eq!(parse("  PLUG \n"), Ok(Event::PlugIn));
-        assert_eq!(parse("Start"), Ok(Event::StartCharging));
+        assert_eq!(parse("  PLUG \n"), Ok(Command::Plug));
+        assert_eq!(parse("Start"), Ok(Command::Start));
         assert_eq!(
             parse("fault   OverCurrent\t"),
-            Ok(Event::Fault(Fault::OverCurrent))
+            Ok(Command::Fault(Fault::OverCurrent))
         );
     }
 
@@ -309,7 +328,7 @@ mod tests {
             ("other", Fault::Other),
         ];
         for (word, fault) in kinds {
-            assert_eq!(parse(&format!("fault {word}")), Ok(Event::Fault(fault)));
+            assert_eq!(parse(&format!("fault {word}")), Ok(Command::Fault(fault)));
         }
     }
 
