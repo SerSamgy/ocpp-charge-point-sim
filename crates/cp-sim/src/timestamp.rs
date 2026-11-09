@@ -12,6 +12,7 @@
 //! sends them (OCPP 1.6 section 4.2 recommends syncing with `currentTime`
 //! of BootNotification.conf; see the roadmap backlog).
 
+use serde::{Serializer, ser::Error};
 use time::{UtcDateTime, format_description::well_known::Rfc3339};
 
 /// `at` as RFC 3339 in UTC, without a fraction: `2026-11-05T12:00:00Z`.
@@ -25,6 +26,19 @@ pub fn rfc3339(at: UtcDateTime) -> Option<String> {
         .ok()?
         .format(&Rfc3339)
         .ok()
+}
+
+/// `rfc3339` for a required field: `#[serde(serialize_with = "timestamp::serialize")]`.
+/// An instant that cannot be written fails the serialization, which
+/// `Client::call` reports as `CallFailure::Encode`, instead of sending a
+/// message without its required time.
+pub fn serialize<S: Serializer>(at: &UtcDateTime, serializer: S) -> Result<S::Ok, S::Error> {
+    match rfc3339(*at) {
+        Some(text) => serializer.serialize_str(&text),
+        None => Err(S::Error::custom(format!(
+            "{at} cannot be written as RFC 3339"
+        ))),
+    }
 }
 
 #[cfg(test)]
