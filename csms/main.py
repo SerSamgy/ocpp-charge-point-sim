@@ -8,7 +8,8 @@ import websockets
 from ocpp.routing import on
 from ocpp.v16 import ChargePoint as cp
 from ocpp.v16 import call_result
-from ocpp.v16.enums import Action, RegistrationStatus
+from ocpp.v16.datatypes import IdTagInfo
+from ocpp.v16.enums import Action, AuthorizationStatus, RegistrationStatus
 
 SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 9000
@@ -23,6 +24,31 @@ BOOT_STATUSES = [
     for status in os.environ.get("BOOT_STATUSES", "Accepted").split(",")
 ]
 BOOT_INTERVAL = int(os.environ.get("BOOT_INTERVAL", "10"))
+
+
+def id_tags(name: str) -> set[str]:
+    """A comma-separated list of idTags from the environment, case-folded:
+    OCPP 1.6 compares idTags without regard to case (CiString20Type)."""
+    return {
+        tag.strip().casefold()
+        for tag in os.environ.get(name, "").split(",")
+        if tag.strip()
+    }
+
+
+# Authorization is configurable for testing the client's transactions:
+#   BLOCKED_ID_TAGS=BAD1,BAD2       Blocked in Authorize and StartTransaction
+#   START_REJECTED_ID_TAGS=LATE1    Accepted in Authorize, Blocked in
+#                                   StartTransaction (the client then stops
+#                                   the transaction with reason DeAuthorized)
+# Every other idTag is Accepted.
+BLOCKED_ID_TAGS = id_tags("BLOCKED_ID_TAGS")
+START_REJECTED_ID_TAGS = id_tags("START_REJECTED_ID_TAGS")
+
+# Transaction IDs are unique per CSMS run, starting at 1.
+next_transaction_id = 1
+# Open transactions: ID -> (charge point ID, idTag, meterStart).
+open_transactions: dict[int, tuple[str, str, int]] = {}
 
 # BootNotifications received per charge point ID. Kept across connections,
 # because a rejected charge point reconnects before booting again.
@@ -68,6 +94,63 @@ class ChargePoint(cp):
             f"status={status} error_code={error_code} timestamp={timestamp}"
         )
         return call_result.StatusNotification()
+
+    @on(Action.authorize)
+    def on_authorize(self, id_tag):
+        status = (
+            AuthorizationStatus.blocked
+            if id_tag.casefold() in BLOCKED_ID_TAGS
+            else AuthorizationStatus.accepted
+        )
+        logger.info(f"Authorize from {self.id}: id_tag={id_tag} -> {status}")
+        return call_result.Authorize(id_tag_info=IdTagInfo(status=status))
+
+    @on(Action.start_transaction)
+    def on_start_transaction(
+        self, connector_id, id_tag, meter_start, timestamp, **kwargs
+    ):
+        global next_transaction_id
+        transaction_id = next_transaction_id
+        next_transaction_id += 1
+        tag = id_tag.casefold()
+        status = (
+            AuthorizationStatus.blocked
+            if tag in BLOCKED_ID_TAGS or tag in START_REJECTED_ID_TAGS
+            else AuthorizationStatus.accepted
+        )
+        # Section 4.8: the CSMS answers with a transaction ID even when it
+        # does not accept the idTag; the charge point then stops it.
+        open_transactions[transaction_id] = (self.id, id_tag, meter_start)
+        logger.info(
+            f"StartTransaction from {self.id}: connector={connector_id} id_tag={id_tag} "
+            f"meter_start={meter_start} timestamp={timestamp} "
+            f"-> transaction_id={transaction_id} {status}"
+        )
+        return call_result.StartTransaction(
+            transaction_id=transaction_id, id_tag_info=IdTagInfo(status=status)
+        )
+
+    @on(Action.stop_transaction)
+    def on_stop_transaction(self, meter_stop, timestamp, transaction_id, **kwargs):
+        reason = kwargs.get("reason", "Local (absent)")
+        id_tag = kwargs.get("id_tag")
+        started = open_transactions.pop(transaction_id, None)
+        if started is None:
+            # A repeated or unknown StopTransaction still gets an ordinary
+            # answer: an error would make the charge point send it again
+            # and again (section 3.7.1).
+            logger.warning(
+                f"StopTransaction from {self.id} for unknown or closed "
+                f"transaction_id={transaction_id}: meter_stop={meter_stop} reason={reason}"
+            )
+        else:
+            _, _, meter_start = started
+            logger.info(
+                f"StopTransaction from {self.id}: transaction_id={transaction_id} "
+                f"id_tag={id_tag} meter_stop={meter_stop} "
+                f"energy={meter_stop - meter_start} Wh reason={reason} timestamp={timestamp}"
+            )
+        return call_result.StopTransaction()
 
 
 async def on_connect(websocket):

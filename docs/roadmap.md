@@ -55,8 +55,24 @@ instead.
          every transition of a live connection; events that happen while
          offline are applied after the reconnect and reported once.
          [#15](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/15)
-5. **Not started.** Transactions: Authorize, StartTransaction,
-   StopTransaction, MeterValues with a simulated energy meter.
+5. **In progress.** Transactions: Authorize, StartTransaction,
+   StopTransaction, MeterValues with a simulated energy meter. In three
+   pull requests.
+   - [x] **5a.** Simulated energy meter (constant 7.4 kW while Charging),
+         `start [idTag]` with Authorize and StartTransaction, `stop` and
+         unplug with StopTransaction, DeAuthorized stop (errata 3.17), an
+         undelivered StopTransaction kept and retried (`pending_stop`), CSMS
+         handlers.
+         [#17](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/17)
+   - [ ] **5b.** Periodic MeterValues during a transaction
+         (`MeterValueSampleInterval`, errata 3.15); decide on
+         `transactionData` in StopTransaction (errata 3.14).
+   - [ ] **5c.** A queue of transaction-related messages with
+         `TransactionMessageAttempts` and `TransactionMessageRetryInterval`
+         (section 3.7), and a transaction whose ID is not known yet
+         (errata 3.18, `transactionId` -1). This changes the 5a model, where
+         a transaction exists only once StartTransaction is answered, and
+         the 5a tests that rely on it.
 
 ## Hardware and system track
 
@@ -130,6 +146,22 @@ Found during the migration inventory; carried over as is
       can take hours after Rejected). Needs the state in the keyboard
       thread or a reply channel; a limitation until buttons replace the
       keyboard (step 8).
+- [ ] Stop an open transaction on shutdown (Ctrl+C, SIGTERM) with a
+      StopTransaction (reason `Local` or `Reboot`); today the CSMS keeps
+      it open (step 5a).
+- [ ] An undelivered StopTransaction (`pending_stop`) is lost on shutdown
+      even though the transaction already ended: send it before Close, or
+      keep it on disk (step 5a).
+- [ ] Offline authorization: Authorization Cache, Local Authorization List,
+      `AllowOfflineTxForUnknownId` (section 3.5). Today a `start` typed
+      while offline is dropped (step 5a).
+- [ ] Use `idTagInfo` beyond its status: `expiryDate`, `parentIdTag`
+      (section 3.10), `ConcurrentTx`.
+- [ ] Configuration keys (`GetConfiguration`, `ChangeConfiguration`):
+      `StopTransactionOnInvalidId`, `StopTransactionOnEVSideDisconnect`,
+      `MeterValueSampleInterval` are constants today (step 5a).
+- [ ] Real energy measurement instead of the constant 7.4 kW of `meter`:
+      a current and voltage sensor on the Pi (hardware track).
 - [ ] `MinimumStatusDuration` (1.6 section 4.9): do not report a status
       that lasted less than the configured time.
 - [ ] Retry a StatusNotification that failed on a live connection
@@ -157,8 +189,9 @@ Found during the migration inventory; carried over as is
 - [ ] `ConnectionTimeOut` (Preparing → Available or Finishing, B1/B6).
 - [ ] B6 (Preparing → Finishing) and F2 (Finishing → Preparing) are in the
       1.6 table but no event produces them; with the cable still plugged in
-      after Finishing only Unplug works (step 5, where a new user at a
-      plugged-in cable makes F2 natural).
+      after Finishing only Unplug works. Step 5a left it so: `start` in
+      Finishing is refused; a new user at a plugged-in cable would make F2
+      natural.
 - [ ] Faults in the connector state machine (step 8): plug and unplug are
       rejected while faulted, so the remembered pre-fault state may
       disagree with the real cable, and a second fault cause during Faulted

@@ -16,6 +16,7 @@ mod connector;
 mod frame;
 mod keyboard;
 mod logging;
+mod meter;
 mod ocpp16;
 mod pending;
 mod session;
@@ -23,6 +24,7 @@ mod status16;
 #[cfg(test)]
 mod test_support;
 mod timestamp;
+mod transaction16;
 
 use std::{io, time::Duration};
 
