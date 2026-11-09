@@ -16,6 +16,14 @@ mod connector;
 mod frame;
 mod keyboard;
 mod logging;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the session starts using the meter with transactions"
+    )
+)]
+mod meter;
 mod ocpp16;
 mod pending;
 mod session;
