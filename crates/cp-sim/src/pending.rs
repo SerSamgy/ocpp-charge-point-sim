@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use tokio::sync::oneshot;
+use tracing::warn;
 
 use crate::frame::Frame;
 
@@ -30,7 +31,7 @@ impl PendingCalls {
             return rx;
         }
         if inner.waiting.insert(id.clone(), tx).is_some() {
-            eprintln!("duplicate pending CALL id={id}; previous waiter dropped")
+            warn!(%id, "duplicate pending CALL id; previous waiter dropped")
         }
         rx
     }

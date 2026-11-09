@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use tracing::warn;
+
 use crate::ocpp16::{BootNotificationResponse, RegistrationStatus};
 
 /// Heartbeat interval when the server accepts us with `interval = 0`.
@@ -32,10 +34,7 @@ pub fn next_step(resp: &BootNotificationResponse) -> BootStep {
     let interval = Duration::from_secs(resp.interval);
     let or_default = |default: Duration| {
         if interval.is_zero() {
-            eprintln!(
-                "{:?} with interval 0, using {default:?} instead",
-                resp.status
-            );
+            warn!(status = ?resp.status, ?default, "interval is 0, using the default instead");
             default
         } else {
             interval
