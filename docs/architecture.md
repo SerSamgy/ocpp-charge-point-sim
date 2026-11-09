@@ -128,11 +128,11 @@ Transactions (OCPP 1.6 sections 3.7, 4.1, 4.8, 4.10, errata 3.17):
 Connection life cycle (`session`): connect → BootNotification until
 Accepted → the undelivered StopTransaction, if any → status reports
 (connector 0, then connector 1) → Heartbeat every `interval` → on loss,
-wait (back-off or the Rejected interval) and connect again. When the reader task ends, every
-waiting and later CALL on that client fails with `Disconnected`, which is
-how `session` learns that the connection is gone. `Station::serve` uses a
-connection until it ends; `run` closes it after Rejected (status 1000) and
-picks the wait.
+wait (back-off or the Rejected interval) and connect again. When the
+reader task ends, every waiting and later CALL on that client fails with
+`Disconnected`, which is how `session` learns that the connection is gone.
+`Station::serve` uses a connection until it ends; `run` closes it after
+Rejected (status 1000) and picks the wait.
 
 Shutdown: `main` hands `session::run` a future that completes on Ctrl+C
 or SIGTERM. `run` races it (`tokio::select!`) against connecting, serving
