@@ -26,16 +26,23 @@ use tracing::warn;
 use crate::connector::Fault;
 
 /// Printed by the `help` command and when stdin is a terminal.
-pub const HELP: &str = "commands: plug, start, stop, unplug, clear, fault <kind>, help\n\
+pub const HELP: &str = "commands: plug, start [idTag], stop, unplug, clear, fault <kind>, help\n\
+                        start without an idTag presents DEMO-TAG\n\
                         fault kinds: ground, overcurrent, overvoltage, undervoltage, temperature, other";
 
+/// The idTag that `start` presents when none is typed: the card a demo
+/// user would hold. Any idTag works, unless the CSMS blocks it.
+pub const DEFAULT_ID_TAG: &str = "DEMO-TAG";
+
 /// What the user did at the charge point.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// `plug`: the cable is inserted.
     Plug,
-    /// `start`: charging starts.
-    Start,
+    /// `start [idTag]`: the user presents an identifier, like an RFID card
+    /// held to the reader. Whether charging starts is up to the CSMS. The
+    /// text is kept as typed; `session` checks that it is a valid idTag.
+    Present { id_tag: String },
     /// `stop`: charging stops, the cable stays plugged in.
     Stop,
     /// `unplug`: the cable is removed.
@@ -49,7 +56,7 @@ pub enum Command {
 /// A command with the instant the user typed it. The instant is the time the
 /// connector reaches its new status, even if the station applies the command
 /// later, after a reconnect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Input {
     pub command: Command,
     pub at: UtcDateTime,
@@ -152,14 +159,22 @@ fn read_inputs(
     }
 }
 
-/// One command per line, case-insensitive, extra whitespace ignored.
+/// One command per line, extra whitespace ignored. Command words are
+/// case-insensitive; an idTag keeps its case, because it is the user's
+/// identifier, not ours.
 pub fn parse(line: &str) -> Result<Command, ParseError> {
-    let lowered = line.to_lowercase();
-    let words: Vec<&str> = lowered.split_whitespace().collect();
+    let original: Vec<&str> = line.split_whitespace().collect();
+    let lowered: Vec<String> = original.iter().map(|word| word.to_lowercase()).collect();
+    let words: Vec<&str> = lowered.iter().map(String::as_str).collect();
     match words.as_slice() {
         [] => Err(ParseError::Empty),
         ["plug"] => Ok(Command::Plug),
-        ["start"] => Ok(Command::Start),
+        ["start"] => Ok(Command::Present {
+            id_tag: DEFAULT_ID_TAG.to_owned(),
+        }),
+        ["start", _] => Ok(Command::Present {
+            id_tag: original[1].to_owned(),
+        }),
         ["stop"] => Ok(Command::Stop),
         ["unplug"] => Ok(Command::Unplug),
         ["clear"] => Ok(Command::Clear),
@@ -212,7 +227,9 @@ mod tests {
                     at: T0
                 },
                 Input {
-                    command: Command::Start,
+                    command: Command::Present {
+                        id_tag: DEFAULT_ID_TAG.into()
+                    },
                     at: T0
                 },
             ]
@@ -239,7 +256,7 @@ mod tests {
     #[test]
     fn a_line_that_is_not_utf8_is_skipped_and_reading_goes_on() {
         let inputs = read_all(b"plug\n\xff\xfe\nstop\n");
-        let commands: Vec<Command> = inputs.iter().map(|i| i.command).collect();
+        let commands: Vec<Command> = inputs.into_iter().map(|i| i.command).collect();
         assert_eq!(commands, [Command::Plug, Command::Stop]);
     }
 
@@ -301,7 +318,12 @@ mod tests {
     #[test]
     fn simple_commands() {
         assert_eq!(parse("plug"), Ok(Command::Plug));
-        assert_eq!(parse("start"), Ok(Command::Start));
+        assert_eq!(
+            parse("start"),
+            Ok(Command::Present {
+                id_tag: "DEMO-TAG".into()
+            })
+        );
         assert_eq!(parse("stop"), Ok(Command::Stop));
         assert_eq!(parse("unplug"), Ok(Command::Unplug));
         assert_eq!(parse("clear"), Ok(Command::Clear));
@@ -310,10 +332,42 @@ mod tests {
     #[test]
     fn case_and_whitespace_do_not_matter() {
         assert_eq!(parse("  PLUG \n"), Ok(Command::Plug));
-        assert_eq!(parse("Start"), Ok(Command::Start));
+        assert_eq!(
+            parse("Start"),
+            Ok(Command::Present {
+                id_tag: "DEMO-TAG".into()
+            })
+        );
         assert_eq!(
             parse("fault   OverCurrent\t"),
             Ok(Command::Fault(Fault::OverCurrent))
+        );
+    }
+
+    #[test]
+    fn start_takes_an_id_tag_and_keeps_its_case() {
+        assert_eq!(
+            parse("START  Card-42 "),
+            Ok(Command::Present {
+                id_tag: "Card-42".into()
+            })
+        );
+        assert_eq!(
+            parse("start Карта-7"),
+            Ok(Command::Present {
+                id_tag: "Карта-7".into()
+            })
+        );
+        // The length is checked by `session` (`transaction16::IdTag`), which
+        // knows the limit of the OCPP version; the keyboard passes it on.
+        let long = "A".repeat(21);
+        assert_eq!(
+            parse(&format!("start {long}")),
+            Ok(Command::Present { id_tag: long })
+        );
+        assert_eq!(
+            parse("start a b"),
+            Err(ParseError::Unknown("start a b".into()))
         );
     }
 

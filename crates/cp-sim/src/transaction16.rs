@@ -68,10 +68,6 @@ impl IdTag {
             Ok(IdTag(text.to_owned()))
         }
     }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 impl fmt::Display for IdTag {
@@ -223,7 +219,7 @@ mod tests {
 
     #[test]
     fn an_id_tag_keeps_its_case() {
-        assert_eq!(IdTag::new("Card-42").unwrap().as_str(), "Card-42");
+        assert_eq!(IdTag::new("Card-42").unwrap().to_string(), "Card-42");
     }
 
     #[test]
@@ -241,7 +237,7 @@ mod tests {
         // 20 Cyrillic letters are 40 bytes in UTF-8, but 20 characters.
         let tag = "Ж".repeat(20);
         assert_eq!(tag.len(), 40);
-        assert_eq!(IdTag::new(&tag).unwrap().as_str(), tag);
+        assert_eq!(IdTag::new(&tag).unwrap().to_string(), tag);
         assert_eq!(
             IdTag::new(&"Ж".repeat(21)),
             Err(InvalidIdTag::TooLong { chars: 21 })

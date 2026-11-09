@@ -16,14 +16,11 @@ mod connector;
 mod frame;
 mod keyboard;
 mod logging;
+mod meter;
 #[cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "the session starts using the meter with transactions"
-    )
+    expect(dead_code, reason = "StopTransaction is sent from the next commit on")
 )]
-mod meter;
 mod ocpp16;
 mod pending;
 mod session;
@@ -33,10 +30,7 @@ mod test_support;
 mod timestamp;
 #[cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "the session starts transactions in a later commit"
-    )
+    expect(dead_code, reason = "StopTransaction is sent from the next commit on")
 )]
 mod transaction16;
 

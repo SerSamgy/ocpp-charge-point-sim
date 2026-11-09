@@ -2,8 +2,10 @@
 //! report the status of the charge point and its connector, Heartbeat, and
 //! reconnect with back-off whenever the connection is lost. After every
 //! Accepted and after every reconnect that skips the boot, the status is
-//! reported again (OCPP 1.6 errata 3.22). Events from the keyboard change the
-//! state of the connector; each one on a live connection is reported at once.
+//! reported again (OCPP 1.6 errata 3.22). Commands from the keyboard change
+//! the state of the connector; each one on a live connection is reported at
+//! once. `start` presents an idTag and begins a transaction when the CSMS
+//! accepts it (Authorize, StartTransaction).
 
 use std::{num::NonZeroU32, time::Duration};
 
@@ -21,10 +23,12 @@ use crate::{
     backoff::{Backoff, BackoffConfig},
     boot::{self, BootStep},
     client::{CallFailure, Client, Timeouts},
-    connector::{Connector, Event},
+    connector::{Connector, Event, State},
     keyboard::{Command, Input},
+    meter::Meter,
     ocpp16::{BootNotificationRequest, HeartbeatRequest, StatusNotificationRequest},
     status16,
+    transaction16::{self, IdTag, Transaction},
 };
 
 /// The one connector of the simulated charge point.
@@ -83,6 +87,8 @@ pub async fn run(
         heartbeat: None,
         started,
         connectors: vec![Connector::new(CONNECTOR_ID, started)],
+        meter: Meter::new(),
+        transaction: None,
         inputs: Some(inputs),
         backoff: Backoff::new(settings.backoff),
         // `StdRng` is `Send`, unlike `rand::rng()`, so the future of `run`
@@ -156,6 +162,11 @@ struct Station<'a> {
     /// When the program started; the time of the status of connector 0.
     started: UtcDateTime,
     connectors: Vec<Connector>,
+    /// The energy meter of the connector.
+    meter: Meter,
+    /// The transaction on the connector, once the CSMS has answered
+    /// StartTransaction. It survives a lost connection.
+    transaction: Option<Transaction>,
     /// Keyboard events; `None` once the sender is gone (stdin closed), so a
     /// closed channel is never polled again.
     inputs: Option<mpsc::Receiver<Input>>,
@@ -272,9 +283,7 @@ impl Station<'_> {
                 // `select!` drops the other futures before it runs a handler,
                 // so the handler may use `self` again.
                 input = next_input(&mut self.inputs) => {
-                    if let Some(request) = self.apply(input)
-                        && let Err(ended) = self.send_report(client, &request).await
-                    {
+                    if let Err(ended) = self.handle(client, input).await {
                         return ended;
                     }
                 }
@@ -316,41 +325,172 @@ impl Station<'_> {
         Ok(())
     }
 
-    /// Applies the events that arrived before now, in order, without
+    /// Applies the inputs that arrived before now, in order, without
     /// reporting them one by one. A closed channel ends the source.
+    ///
+    /// `start` needs the CSMS (Authorize), and charging on an identifier
+    /// that nobody has checked would give energy away: the station has no
+    /// offline authorization (no Authorization Cache, no Local
+    /// Authorization List, section 3.5). So a `start` typed while the
+    /// station could not talk is dropped with a message.
+    #[expect(
+        clippy::print_stderr,
+        reason = "replies to what the owner types, not log events: a log filter must not hide them"
+    )]
     fn apply_queued(&mut self) {
         while let Some(receiver) = &mut self.inputs {
             match receiver.try_recv() {
-                Ok(input) => {
-                    self.apply(input);
-                }
+                Ok(input) => match event(&input.command) {
+                    Some(event) => {
+                        self.apply(event, input.at);
+                    }
+                    None => eprintln!(
+                        "start was typed while the station was offline: \
+                         no offline authorization, ignored"
+                    ),
+                },
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => self.inputs = None,
             }
         }
     }
 
-    /// Applies one input to the connector. On a state change the connector
-    /// is stamped with the instant of the input and the request to report it
-    /// is returned. An event that does not fit the state is printed and
+    /// One input on a live connection.
+    async fn handle(&mut self, client: &Client, input: Input) -> Result<(), Ended> {
+        match input.command {
+            Command::Present { id_tag } => self.present(client, &id_tag, input.at).await,
+            command => {
+                let Some(event) = event(&command) else {
+                    return Ok(());
+                };
+                match self.apply(event, input.at) {
+                    Some(report) => self.send_report(client, &report).await,
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// `start`: the user presents `text` as an idTag at `at`. Only in
+    /// Preparing (cable plugged in) and without an open transaction.
+    /// Authorize, then StartTransaction; once the CSMS has answered it, the
+    /// transaction exists and the connector starts charging. Anything that
+    /// goes wrong before that answer leaves the connector in Preparing and
+    /// tells the user; a lost connection ends the connection as usual.
+    ///
+    /// A StartTransaction whose answer is lost with the connection may
+    /// have created a transaction in the CSMS that the station does not
+    /// know (errata 3.18, roadmap step 5c).
+    #[expect(
+        clippy::print_stderr,
+        reason = "replies to what the owner types, not log events: a log filter must not hide them"
+    )]
+    async fn present(&mut self, client: &Client, text: &str, at: UtcDateTime) -> Result<(), Ended> {
+        let Some(&Connector { id, state, .. }) = self.connectors.first() else {
+            return Ok(());
+        };
+        if state != State::Preparing {
+            eprintln!("connector {id}: start does not fit {state:?}, plug in first; ignored");
+            return Ok(());
+        }
+        if let Some(open) = &self.transaction {
+            eprintln!(
+                "connector {id}: transaction {} is still open, ignored",
+                open.id
+            );
+            return Ok(());
+        }
+        let id_tag = match IdTag::new(text) {
+            Ok(id_tag) => id_tag,
+            Err(err) => {
+                eprintln!("{err}; ignored");
+                return Ok(());
+            }
+        };
+
+        match client.call(&transaction16::authorize(&id_tag)).await {
+            Ok(response) => {
+                self.backoff.reset();
+                if let Err(status) = transaction16::authorized(&response) {
+                    eprintln!("idTag {id_tag} is not authorized ({status:?}): no charging");
+                    return Ok(());
+                }
+            }
+            Err(CallFailure::Disconnected) => {
+                eprintln!("connection lost during Authorize: no charging, start again");
+                return Err(Ended::Lost);
+            }
+            Err(err) => {
+                warn!(%err, "Authorize failed");
+                eprintln!("idTag {id_tag} could not be authorized: no charging");
+                return Ok(());
+            }
+        }
+
+        let meter_start = self.meter.reading(at);
+        let request = transaction16::start(id, &id_tag, meter_start, at);
+        let response = match client.call(&request).await {
+            Ok(response) => {
+                self.backoff.reset();
+                response
+            }
+            Err(CallFailure::Disconnected) => {
+                eprintln!("connection lost during StartTransaction: no charging, start again");
+                return Err(Ended::Lost);
+            }
+            Err(err) => {
+                warn!(%err, "StartTransaction failed");
+                eprintln!("the transaction could not be started: no charging");
+                return Ok(());
+            }
+        };
+
+        info!(
+            transaction_id = response.transaction_id,
+            id_tag = %id_tag,
+            meter_start,
+            "transaction started"
+        );
+        self.transaction = Some(Transaction {
+            id: response.transaction_id,
+            id_tag,
+            meter_start,
+        });
+        match self.apply(Event::StartCharging, at) {
+            Some(report) => self.send_report(client, &report).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Applies one event to the connector at `at`. On a state change the
+    /// connector is stamped with `at`, the meter runs exactly while the
+    /// connector is Charging, and the request to report the new state is
+    /// returned. An event that does not fit the state is printed and
     /// changes nothing.
     #[expect(
         clippy::print_stderr,
         reason = "replies to what the owner types, not log events: a log filter must not hide them"
     )]
-    fn apply(&mut self, input: Input) -> Option<StatusNotificationRequest> {
+    fn apply(&mut self, event: Event, at: UtcDateTime) -> Option<StatusNotificationRequest> {
         let connector = self.connectors.first_mut()?;
-        match connector.state.on(event(input.command)) {
+        let before = connector.state;
+        match before.on(event) {
             Ok(state) => {
                 info!(
                     connector = connector.id,
-                    from = ?connector.state,
+                    from = ?before,
                     to = ?state,
                     "connector state changed"
                 );
                 connector.state = state;
-                connector.since = input.at;
-                Some(status16::status_notification(connector.id, state, input.at))
+                connector.since = at;
+                match (before, state) {
+                    (State::Charging, State::Charging) => {}
+                    (_, State::Charging) => self.meter.start(at),
+                    (State::Charging, _) => self.meter.stop(at),
+                    _ => {}
+                }
+                Some(status16::status_notification(connector.id, state, at))
             }
             Err(invalid) => {
                 eprintln!(
@@ -363,15 +503,19 @@ impl Station<'_> {
     }
 }
 
-/// The connector event a keyboard command stands for.
-fn event(command: Command) -> Event {
+/// The connector event a keyboard command stands for; `None` for `start`,
+/// which changes the connector only through a transaction. No command
+/// stands for `StartCharging`: only `Station::present` produces it, after
+/// the CSMS has answered StartTransaction, so a Charging connector always
+/// has a transaction.
+fn event(command: &Command) -> Option<Event> {
     match command {
-        Command::Plug => Event::PlugIn,
-        Command::Start => Event::StartCharging,
-        Command::Stop => Event::StopCharging,
-        Command::Unplug => Event::Unplug,
-        Command::Fault(fault) => Event::Fault(fault),
-        Command::Clear => Event::ClearFault,
+        Command::Plug => Some(Event::PlugIn),
+        Command::Present { .. } => None,
+        Command::Stop => Some(Event::StopCharging),
+        Command::Unplug => Some(Event::Unplug),
+        Command::Fault(fault) => Some(Event::Fault(*fault)),
+        Command::Clear => Some(Event::ClearFault),
     }
 }
 
@@ -991,8 +1135,8 @@ mod tests {
         let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
         connect_and_accept(&mut csms).await;
 
-        // Charging cannot start while Available: no message, no change.
-        inputs.send(input(Command::Start, T0)).await.unwrap();
+        // Charging cannot stop while Available: no message, no change.
+        inputs.send(input(Command::Stop, T0)).await.unwrap();
         inputs.send(input(Command::Plug, T0 + 60)).await.unwrap();
 
         // The first report is the one for the valid event, still from Available.
@@ -1005,10 +1149,9 @@ mod tests {
         let mut csms = FakeCsms::start().await;
         let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
         connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs).await;
 
         let steps = [
-            (Command::Plug, "Preparing", "NoError"),
-            (Command::Start, "Charging", "NoError"),
             (
                 Command::Fault(Fault::OverCurrent),
                 "Faulted",
@@ -1016,9 +1159,9 @@ mod tests {
             ),
             (Command::Clear, "Charging", "NoError"),
         ];
-        for (n, (event, status, error_code)) in steps.into_iter().enumerate() {
-            let unix = T0 + 60 * n as i64;
-            inputs.send(input(event, unix)).await.unwrap();
+        for (n, (command, status, error_code)) in steps.into_iter().enumerate() {
+            let unix = T0 + 120 + 60 * n as i64;
+            inputs.send(input(command, unix)).await.unwrap();
             let (id, payload) = recv_report(&mut csms).await;
             assert_eq!(payload["connectorId"], 1);
             assert_eq!(payload["status"], status, "step {n}");
@@ -1060,7 +1203,8 @@ mod tests {
         // The client is in its back-off wait now (MIN, much longer than this).
         sleep(Duration::from_millis(50)).await;
         inputs.send(input(Command::Plug, T0)).await.unwrap();
-        inputs.send(input(Command::Start, T0 + 60)).await.unwrap();
+        inputs.send(input(Command::Unplug, T0 + 60)).await.unwrap();
+        inputs.send(input(Command::Plug, T0 + 120)).await.unwrap();
         assert!(matches!(
             csms.recv_event_within(LONG).await,
             Event::Connected
@@ -1069,8 +1213,8 @@ mod tests {
         // No notification per event: connector 0, then connector 1 with the
         // final status and the time of the last input, then the Heartbeat.
         expect_report(&mut csms, report_payload(0)).await;
-        let charging = report_at(1, "Charging", "NoError", "2026-11-05T12:01:00Z");
-        expect_report(&mut csms, charging).await;
+        let preparing = report_at(1, "Preparing", "NoError", "2026-11-05T12:02:00Z");
+        expect_report(&mut csms, preparing).await;
         call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
     }
 
@@ -1103,6 +1247,306 @@ mod tests {
         for _ in 0..2 {
             let id = call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
             csms.send(heartbeat_result(&id));
+        }
+    }
+
+    // --- Transactions ---
+
+    const TAG: &str = "Card-42";
+    /// The transaction ID the fake CSMS gives.
+    const TX: i32 = 7;
+
+    fn present(id_tag: &str, unix: i64) -> Input {
+        input(
+            Command::Present {
+                id_tag: id_tag.into(),
+            },
+            unix,
+        )
+    }
+
+    /// `T0 + offset` as it appears on the wire.
+    fn wire_time(offset: i64) -> String {
+        crate::timestamp::rfc3339(UtcDateTime::from_unix_timestamp(T0 + offset).unwrap()).unwrap()
+    }
+
+    /// The next event must be a CALL of `action`; returns its ID and payload.
+    async fn recv_call(csms: &mut FakeCsms, action: &str) -> (String, serde_json::Value) {
+        match csms.recv_event().await {
+            Event::Frame(Frame::Call {
+                id,
+                action: a,
+                payload,
+            }) if a == action => (id, payload),
+            other => panic!("expected a {action} CALL, got {other:?}"),
+        }
+    }
+
+    fn authorize_result(id: &str, status: &str) -> Frame {
+        Frame::CallResult {
+            id: id.into(),
+            payload: json!({"idTagInfo": {"status": status}}),
+        }
+    }
+
+    fn start_result(id: &str, status: &str) -> Frame {
+        Frame::CallResult {
+            id: id.into(),
+            payload: json!({"idTagInfo": {"status": status}, "transactionId": TX}),
+        }
+    }
+
+    /// `plug` at T0, answered.
+    async fn plug_in(csms: &mut FakeCsms, inputs: &mpsc::Sender<Input>) {
+        inputs.send(input(Command::Plug, T0)).await.unwrap();
+        expect_report(csms, report_at(1, "Preparing", "NoError", &wire_time(0))).await;
+    }
+
+    /// `plug` at T0 and `start Card-42` at T0 + 60; the CSMS accepts the
+    /// idTag and starts transaction `TX` with the meter at 0. Returns once
+    /// the Charging report is answered.
+    async fn start_charging(csms: &mut FakeCsms, inputs: &mpsc::Sender<Input>) {
+        plug_in(csms, inputs).await;
+        inputs.send(present(TAG, T0 + 60)).await.unwrap();
+        let (id, _) = recv_call(csms, "Authorize").await;
+        csms.send(authorize_result(&id, "Accepted"));
+        let (id, _) = recv_call(csms, "StartTransaction").await;
+        csms.send(start_result(&id, "Accepted"));
+        expect_report(csms, report_at(1, "Charging", "NoError", &wire_time(60))).await;
+    }
+
+    #[tokio::test]
+    async fn start_authorizes_then_starts_the_transaction_then_charges() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        plug_in(&mut csms, &inputs).await;
+
+        inputs.send(present(TAG, T0 + 60)).await.unwrap();
+        // The idTag as typed, case included.
+        let (id, payload) = recv_call(&mut csms, "Authorize").await;
+        assert_eq!(payload, json!({"idTag": TAG}));
+        csms.send(authorize_result(&id, "Accepted"));
+        // The meter has never run: 0 Wh. The time is the time of `start`.
+        let (id, payload) = recv_call(&mut csms, "StartTransaction").await;
+        assert_eq!(
+            payload,
+            json!({
+                "connectorId": 1,
+                "idTag": TAG,
+                "meterStart": 0,
+                "timestamp": wire_time(60),
+            })
+        );
+        csms.send(start_result(&id, "Accepted"));
+        // Only now, with a transaction, does the connector charge.
+        let charging = report_at(1, "Charging", "NoError", &wire_time(60));
+        expect_report(&mut csms, charging).await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_id_tag_starts_nothing() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        plug_in(&mut csms, &inputs).await;
+
+        inputs.send(present(TAG, T0 + 60)).await.unwrap();
+        let (id, _) = recv_call(&mut csms, "Authorize").await;
+        csms.send(authorize_result(&id, "Blocked"));
+
+        // The next frame is the report of the next command, not a
+        // StartTransaction: the connector is still in Preparing.
+        inputs.send(input(Command::Unplug, T0 + 120)).await.unwrap();
+        let available = report_at(1, "Available", "NoError", &wire_time(120));
+        expect_report(&mut csms, available).await;
+    }
+
+    #[tokio::test]
+    async fn start_outside_preparing_sends_nothing() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+
+        // No cable: no Authorize.
+        inputs.send(present(TAG, T0)).await.unwrap();
+        plug_in(&mut csms, &inputs).await;
+    }
+
+    #[tokio::test]
+    async fn an_invalid_id_tag_sends_nothing() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        plug_in(&mut csms, &inputs).await;
+
+        // 21 characters, one more than an idTag may have.
+        inputs
+            .send(present(&"A".repeat(21), T0 + 60))
+            .await
+            .unwrap();
+        inputs.send(present(TAG, T0 + 120)).await.unwrap();
+        let (_, payload) = recv_call(&mut csms, "Authorize").await;
+        assert_eq!(payload, json!({"idTag": TAG}));
+    }
+
+    #[tokio::test]
+    async fn start_while_offline_is_ignored() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+
+        csms.close_connection();
+        assert!(matches!(csms.recv_event().await, Event::Closed { .. }));
+        sleep(Duration::from_millis(50)).await;
+        inputs.send(input(Command::Plug, T0)).await.unwrap();
+        inputs.send(present(TAG, T0 + 60)).await.unwrap();
+        assert!(matches!(
+            csms.recv_event_within(LONG).await,
+            Event::Connected
+        ));
+
+        // The plug counts, the start does not: no offline authorization.
+        expect_report(&mut csms, report_payload(0)).await;
+        let preparing = report_at(1, "Preparing", "NoError", &wire_time(0));
+        expect_report(&mut csms, preparing).await;
+        call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
+    }
+
+    #[tokio::test]
+    async fn start_while_a_transaction_is_open_is_ignored() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs).await;
+
+        // Back to Preparing through a fault and a clear would resume
+        // Charging, so go through Finishing and Available instead.
+        let steps = [
+            (Command::Stop, "Finishing"),
+            (Command::Unplug, "Available"),
+            (Command::Plug, "Preparing"),
+        ];
+        for (n, (command, status)) in steps.into_iter().enumerate() {
+            let unix = T0 + 120 + 60 * n as i64;
+            inputs.send(input(command, unix)).await.unwrap();
+            let (id, payload) = recv_report(&mut csms).await;
+            assert_eq!(payload["status"], status, "step {n}");
+            csms.send(empty_result(&id));
+        }
+        inputs.send(present(TAG, T0 + 300)).await.unwrap();
+        inputs.send(input(Command::Unplug, T0 + 360)).await.unwrap();
+        let available = report_at(1, "Available", "NoError", &wire_time(360));
+        expect_report(&mut csms, available).await;
+    }
+
+    #[tokio::test]
+    async fn connection_lost_during_authorize_starts_no_transaction() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        plug_in(&mut csms, &inputs).await;
+
+        inputs.send(present(TAG, T0 + 60)).await.unwrap();
+        recv_call(&mut csms, "Authorize").await; // never answered
+        csms.close_connection();
+        reconnect_gap(&mut csms).await;
+
+        // Still Preparing, and a new start is accepted: no transaction.
+        expect_report(&mut csms, report_payload(0)).await;
+        let preparing = report_at(1, "Preparing", "NoError", &wire_time(0));
+        expect_report(&mut csms, preparing).await;
+        inputs.send(present(TAG, T0 + 120)).await.unwrap();
+        recv_call(&mut csms, "Authorize").await;
+    }
+
+    #[tokio::test]
+    async fn connection_lost_during_start_transaction_starts_no_transaction() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        plug_in(&mut csms, &inputs).await;
+
+        inputs.send(present(TAG, T0 + 60)).await.unwrap();
+        let (id, _) = recv_call(&mut csms, "Authorize").await;
+        csms.send(authorize_result(&id, "Accepted"));
+        recv_call(&mut csms, "StartTransaction").await; // never answered
+        csms.close_connection();
+        reconnect_gap(&mut csms).await;
+
+        expect_report(&mut csms, report_payload(0)).await;
+        let preparing = report_at(1, "Preparing", "NoError", &wire_time(0));
+        expect_report(&mut csms, preparing).await;
+        inputs.send(present(TAG, T0 + 120)).await.unwrap();
+        recv_call(&mut csms, "Authorize").await;
+    }
+
+    /// How the fake CSMS fails a CALL.
+    #[derive(Clone, Copy)]
+    enum Failure {
+        CallError,
+        Timeout,
+    }
+
+    /// `start`, with the CALL of `action` failing as `failure`: the
+    /// connection stays, the connector stays in Preparing, and the next
+    /// command is reported on the same connection.
+    async fn failed_start_keeps_connection(action: &str, failure: Failure) {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(SHORT));
+        connect_and_accept(&mut csms).await;
+        plug_in(&mut csms, &inputs).await;
+
+        inputs.send(present(TAG, T0 + 60)).await.unwrap();
+        let (id, _) = recv_call(&mut csms, "Authorize").await;
+        let id = if action == "Authorize" {
+            id
+        } else {
+            csms.send(authorize_result(&id, "Accepted"));
+            recv_call(&mut csms, action).await.0
+        };
+        if let Failure::CallError = failure {
+            csms.send(call_error(&id));
+        } // else never answered: the call times out after SHORT
+
+        inputs.send(input(Command::Unplug, T0 + 120)).await.unwrap();
+        let available = report_at(1, "Available", "NoError", &wire_time(120));
+        expect_report(&mut csms, available).await;
+    }
+
+    #[tokio::test]
+    async fn authorize_call_error_keeps_connection() {
+        failed_start_keeps_connection("Authorize", Failure::CallError).await;
+    }
+
+    #[tokio::test]
+    async fn authorize_timeout_keeps_connection() {
+        failed_start_keeps_connection("Authorize", Failure::Timeout).await;
+    }
+
+    #[tokio::test]
+    async fn start_transaction_call_error_keeps_connection() {
+        failed_start_keeps_connection("StartTransaction", Failure::CallError).await;
+    }
+
+    #[tokio::test]
+    async fn start_transaction_timeout_keeps_connection() {
+        failed_start_keeps_connection("StartTransaction", Failure::Timeout).await;
+    }
+
+    #[tokio::test]
+    async fn a_started_transaction_is_logged_with_its_fields() {
+        let logs = LogCapture::start(EnvFilter::new("cp_sim=info"));
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs).await;
+
+        let text = logs.text();
+        let line = text.lines().find(|l| l.contains("transaction started"));
+        let line = line.unwrap_or_else(|| panic!("no transaction start in the log:\n{text}"));
+        for field in ["transaction_id=7", "id_tag=Card-42", "meter_start=0"] {
+            assert!(line.contains(field), "{field} missing in: {line}");
         }
     }
 
@@ -1219,6 +1663,40 @@ mod tests {
             "waited for the call: {took:?}"
         );
         assert_closed_with(&mut csms, 1001).await;
+    }
+
+    /// Shutdown while the CALL of `action` of a `start` is in flight.
+    async fn shutdown_during_start(action: &str) {
+        let mut csms = FakeCsms::start().await;
+        let (stop, signal) = shutdown_signal();
+        let (inputs_tx, inputs) = mpsc::channel(8);
+        let cp = spawn_run_with(&csms.url, settings(LONG), inputs, signal);
+        connect_and_accept(&mut csms).await;
+        plug_in(&mut csms, &inputs_tx).await;
+        inputs_tx.send(present(TAG, T0 + 60)).await.unwrap();
+        let (id, _) = recv_call(&mut csms, "Authorize").await;
+        if action != "Authorize" {
+            csms.send(authorize_result(&id, "Accepted"));
+            recv_call(&mut csms, action).await; // never answered
+        }
+
+        stop.send(()).unwrap();
+        let took = time_to_stop(cp).await;
+        assert!(
+            took < Duration::from_secs(1),
+            "waited for the call: {took:?}"
+        );
+        assert_closed_with(&mut csms, 1001).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_authorize_closes_connection() {
+        shutdown_during_start("Authorize").await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_start_transaction_closes_connection() {
+        shutdown_during_start("StartTransaction").await;
     }
 
     #[tokio::test]
