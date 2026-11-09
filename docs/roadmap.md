@@ -58,7 +58,7 @@ instead.
 5. **In progress.** Transactions: Authorize, StartTransaction,
    StopTransaction, MeterValues with a simulated energy meter. In three
    pull requests.
-   - [ ] **5a.** Simulated energy meter (constant 7.4 kW while Charging),
+   - [x] **5a.** Simulated energy meter (constant 7.4 kW while Charging),
          `start [idTag]` with Authorize and StartTransaction, `stop` and
          unplug with StopTransaction, DeAuthorized stop (errata 3.17), an
          undelivered StopTransaction kept and retried (`pending_stop`), CSMS
