@@ -34,7 +34,9 @@ use crate::{
     meter::Meter,
     ocpp16::{BootNotificationRequest, HeartbeatRequest, StatusNotificationRequest},
     status16,
-    transaction16::{self, IdTag, StartDecision, StopCause, Transaction, TxMessage},
+    transaction16::{
+        self, IdTag, Outgoing, StartDecision, StopCause, Transaction, TxIds, TxMessage,
+    },
     tx_queue::{Failure, TxQueue},
 };
 
@@ -113,6 +115,8 @@ pub async fn run(
         meter: Meter::new(),
         transaction: None,
         sampler: None,
+        ids: TxIds::default(),
+        next_local: 1,
         queue: TxQueue::new(
             settings.transaction_attempts,
             settings.transaction_retry_interval,
@@ -199,6 +203,10 @@ struct Station<'a> {
     /// `None` without a transaction or with sampling off. Like the
     /// transaction, it survives a lost connection.
     sampler: Option<Interval>,
+    /// The transaction IDs the CSMS gave, by local transaction number.
+    ids: TxIds,
+    /// The local number of the next transaction.
+    next_local: u32,
     /// StopTransaction and MeterValues until the CSMS has answered them, or
     /// they failed too often. They are transaction-related and must reach
     /// the CSMS in order (section 3.7), so they wait here across lost
@@ -432,19 +440,24 @@ impl Station<'_> {
         let Some(transaction) = &self.transaction else {
             return Ok(());
         };
-        let transaction_id = transaction.id;
+        let local = transaction.local;
         let at = UtcDateTime::now();
         let register_wh = self.meter.reading(at);
-        let request = transaction16::sample(CONNECTOR_ID, transaction, register_wh, at);
-        info!(transaction_id, register_wh, "meter sampled");
+        info!(
+            transaction_id = self.ids.resolve(local),
+            register_wh, "meter sampled"
+        );
         let dropped = self.queue.push_limited(
-            TxMessage::Sample(request),
+            TxMessage::Sample {
+                local,
+                data: transaction16::sample(CONNECTOR_ID, register_wh, at),
+            },
             TxMessage::is_sample,
             self.settings.sample_queue_limit,
         );
         for message in dropped {
             warn!(
-                transaction_id = message.transaction_id(),
+                transaction_id = self.ids.resolve(message.local()),
                 limit = self.settings.sample_queue_limit,
                 "too many MeterValues waiting, the oldest dropped"
             );
@@ -482,9 +495,10 @@ impl Station<'_> {
     async fn drain(&mut self, client: &Client) -> Result<(), Ended> {
         while let Some(message) = self.queue.head_due(Instant::now()) {
             let message = message.clone();
-            let sent = match &message {
-                TxMessage::Stop(request) => client.call(request).await.map(drop),
-                TxMessage::Sample(request) => client.call(request).await.map(drop),
+            let transaction_id = self.ids.resolve(message.local());
+            let sent = match message.outgoing(&self.ids) {
+                Outgoing::Stop(request) => client.call(&request).await.map(drop),
+                Outgoing::Sample(request) => client.call(&request).await.map(drop),
             };
             let err = match sent {
                 Ok(()) => {
@@ -494,11 +508,12 @@ impl Station<'_> {
                     if let Some((_, failures @ 1..)) = self.queue.delivered() {
                         info!(
                             action = message.action(),
-                            transaction_id = message.transaction_id(),
+                            transaction_id,
                             after_failures = failures,
                             "transaction message delivered"
                         );
                     }
+                    self.done_with(&message);
                     continue;
                 }
                 Err(CallFailure::Disconnected) => return Err(Ended::Lost),
@@ -508,24 +523,36 @@ impl Station<'_> {
                 Some(Failure::RetryAt(due)) => {
                     warn!(
                         action = message.action(),
-                        transaction_id = message.transaction_id(),
+                        transaction_id,
                         %err,
                         retry_in = ?due.saturating_duration_since(Instant::now()),
                         "transaction message failed, will retry"
                     );
                     return Ok(());
                 }
-                Some(Failure::Discarded { transmissions, .. }) => warn!(
-                    action = message.action(),
-                    transaction_id = message.transaction_id(),
-                    attempts = transmissions,
-                    %err,
-                    "transaction message discarded"
-                ),
+                Some(Failure::Discarded { transmissions, .. }) => {
+                    warn!(
+                        action = message.action(),
+                        transaction_id,
+                        attempts = transmissions,
+                        %err,
+                        "transaction message discarded"
+                    );
+                    self.done_with(&message);
+                }
                 None => return Ok(()),
             }
         }
         Ok(())
+    }
+
+    /// A message left the queue, delivered or discarded. After the
+    /// StopTransaction nothing else of that transaction follows, so its ID
+    /// is not needed any more.
+    fn done_with(&mut self, message: &TxMessage) {
+        if let TxMessage::Stop { local, .. } = message {
+            self.ids.forget(*local);
+        }
     }
 
     /// Applies the inputs that arrived before now, in order, without
@@ -607,7 +634,7 @@ impl Station<'_> {
         if let Some(open) = &self.transaction {
             eprintln!(
                 "connector {id}: transaction {} is still open, ignored",
-                open.id
+                self.ids.resolve(open.local)
             );
             return Ok(());
         }
@@ -675,13 +702,16 @@ impl Station<'_> {
             meter_start,
             "transaction started"
         );
+        let local = self.next_local;
+        self.next_local = self.next_local.wrapping_add(1);
+        let decision = self.ids.on_delivered(local, &response);
         self.transaction = Some(Transaction {
-            id: response.transaction_id,
+            local,
             id_tag,
             meter_start,
         });
         let charging = self.apply(Event::StartCharging, at);
-        let stopped = match transaction16::on_start_conf(&response) {
+        let stopped = match decision {
             StartDecision::Charge => {
                 self.sampler = self.new_sampler();
                 None
@@ -719,15 +749,18 @@ impl Station<'_> {
         };
         self.sampler = None;
         let meter_stop = self.meter.reading(at);
-        let request = transaction16::stop(&transaction, cause, meter_stop, at);
+        let data = transaction16::stop(&transaction, cause, meter_stop, at);
         info!(
-            transaction_id = transaction.id,
+            transaction_id = self.ids.resolve(transaction.local),
             meter_stop,
             energy_wh = meter_stop.saturating_sub(transaction.meter_start),
-            reason = ?request.reason,
+            reason = ?data.reason,
             "transaction stopped"
         );
-        self.queue.push(TxMessage::Stop(request));
+        self.queue.push(TxMessage::Stop {
+            local: transaction.local,
+            data,
+        });
     }
 
     /// Applies one event to the connector at `at`. On a state change the
