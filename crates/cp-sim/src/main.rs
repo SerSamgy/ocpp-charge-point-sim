@@ -12,13 +12,6 @@
 mod backoff;
 mod boot;
 mod client;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the session takes back late authorizations from a later commit on"
-    )
-)]
 mod connector;
 mod frame;
 mod keyboard;

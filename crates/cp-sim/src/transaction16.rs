@@ -252,17 +252,28 @@ pub fn sample(connector: NonZeroU32, register_wh: u64, at: UtcDateTime) -> Sampl
 }
 
 /// A transaction-related message (section 3.7) waiting in the queue of the
-/// station, for the transaction `local`. StartTransaction is not queued
-/// yet: it goes out directly (roadmap step 5c2).
+/// station, for the transaction `local`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TxMessage {
-    Stop { local: u32, data: StopData },
-    Sample { local: u32, data: SampleData },
+    /// StartTransaction carries no transaction ID, so it is kept ready.
+    Start {
+        local: u32,
+        request: StartTransactionRequest,
+    },
+    Stop {
+        local: u32,
+        data: StopData,
+    },
+    Sample {
+        local: u32,
+        data: SampleData,
+    },
 }
 
 /// A queued message as it goes on the wire.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outgoing {
+    Start(StartTransactionRequest),
     Stop(StopTransactionRequest),
     Sample(MeterValuesRequest),
 }
@@ -271,6 +282,7 @@ impl TxMessage {
     /// The action name, for the log.
     pub fn action(&self) -> &'static str {
         match self {
+            TxMessage::Start { .. } => StartTransactionRequest::ACTION,
             TxMessage::Stop { .. } => StopTransactionRequest::ACTION,
             TxMessage::Sample { .. } => MeterValuesRequest::ACTION,
         }
@@ -279,7 +291,9 @@ impl TxMessage {
     /// The transaction the message belongs to.
     pub fn local(&self) -> u32 {
         match self {
-            TxMessage::Stop { local, .. } | TxMessage::Sample { local, .. } => *local,
+            TxMessage::Start { local, .. }
+            | TxMessage::Stop { local, .. }
+            | TxMessage::Sample { local, .. } => *local,
         }
     }
 
@@ -299,6 +313,7 @@ impl TxMessage {
     pub fn outgoing(&self, ids: &TxIds) -> Outgoing {
         let transaction_id = ids.resolve(self.local());
         match self {
+            TxMessage::Start { request, .. } => Outgoing::Start(request.clone()),
             TxMessage::Stop { data, .. } => Outgoing::Stop(StopTransactionRequest {
                 id_tag: data.id_tag.clone(),
                 meter_stop: data.meter_stop,
@@ -561,5 +576,21 @@ mod tests {
         assert_eq!(sample.action(), "MeterValues");
         assert_eq!(sample.local(), 3);
         assert!(sample.is_sample());
+    }
+
+    #[test]
+    fn a_queued_start_goes_out_as_it_was_built() {
+        let request = start(ONE, &IdTag::new("Card-42").unwrap(), 246, AT);
+        let message = TxMessage::Start {
+            local: 3,
+            request: request.clone(),
+        };
+        assert_eq!(message.action(), "StartTransaction");
+        assert_eq!(message.local(), 3);
+        assert!(!message.is_sample());
+        assert_eq!(
+            message.outgoing(&TxIds::default()),
+            Outgoing::Start(request)
+        );
     }
 }
