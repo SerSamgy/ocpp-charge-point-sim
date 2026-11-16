@@ -19,6 +19,7 @@ mod logging;
 mod meter;
 mod ocpp16;
 mod pending;
+mod sample_grid;
 mod session;
 mod status16;
 #[cfg(test)]
