@@ -25,7 +25,7 @@ use time::UtcDateTime;
 
 use crate::ocpp16::{
     AuthorizationStatus, AuthorizeRequest, AuthorizeResponse, Measurand, MeterValue,
-    MeterValuesRequest, ReadingContext, SampledValue, StartTransactionRequest,
+    MeterValuesRequest, ReadingContext, Request, SampledValue, StartTransactionRequest,
     StartTransactionResponse, StopReason, StopTransactionRequest, UnitOfMeasure,
 };
 
@@ -220,6 +220,40 @@ pub fn sample(
     }
 }
 
+/// A transaction-related message (section 3.7) waiting in the queue of the
+/// station. StartTransaction is not queued yet: it goes out directly, and
+/// the transaction exists only once it is answered (roadmap step 5c2).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TxMessage {
+    Stop(StopTransactionRequest),
+    Sample(MeterValuesRequest),
+}
+
+impl TxMessage {
+    /// The action name, for the log.
+    pub fn action(&self) -> &'static str {
+        match self {
+            TxMessage::Stop(_) => StopTransactionRequest::ACTION,
+            TxMessage::Sample(_) => MeterValuesRequest::ACTION,
+        }
+    }
+
+    /// The transaction the message belongs to.
+    pub fn transaction_id(&self) -> Option<i32> {
+        match self {
+            TxMessage::Stop(request) => Some(request.transaction_id),
+            TxMessage::Sample(request) => request.transaction_id,
+        }
+    }
+
+    /// Whether the limit on waiting samples may drop the message. Only a
+    /// sample may go: the next one carries a newer register, while a
+    /// StopTransaction carries the meterStop the CSMS bills.
+    pub fn is_sample(&self) -> bool {
+        matches!(self, TxMessage::Sample(_))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,5 +409,18 @@ mod tests {
                 }],
             })
         );
+    }
+
+    #[test]
+    fn a_queued_message_names_its_action_and_transaction() {
+        let stop = TxMessage::Stop(stop(&transaction(), StopCause::Local, 346, AT));
+        assert_eq!(stop.action(), "StopTransaction");
+        assert_eq!(stop.transaction_id(), Some(7));
+        assert!(!stop.is_sample());
+
+        let sample = TxMessage::Sample(sample(ONE, &transaction(), 246, AT));
+        assert_eq!(sample.action(), "MeterValues");
+        assert_eq!(sample.transaction_id(), Some(7));
+        assert!(sample.is_sample());
     }
 }

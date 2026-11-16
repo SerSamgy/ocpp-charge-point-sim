@@ -24,6 +24,13 @@ mod status16;
 #[cfg(test)]
 mod test_support;
 mod timestamp;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the session queues transaction messages from a later commit on"
+    )
+)]
 mod transaction16;
 #[cfg_attr(
     not(test),
