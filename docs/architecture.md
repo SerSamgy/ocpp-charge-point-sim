@@ -11,7 +11,7 @@ structure (crates, modules, message flow, invariants) updates this page.
 |---|---|
 | `crates/cp-sim` | The charge point: an OCPP-J client over WebSocket, Tokio runtime. One binary. |
 | `crates/cp-blink` | GPIO experiments on the Pi (`rppal`): LED, buttons, debouncing. Standalone binaries, not used by `cp-sim` yet (roadmap step 8). Pins: `docs/hardware/`. |
-| `csms/` | Python test CSMS on the `ocpp` library. Answers BootNotification (status sequence and interval configurable through `BOOT_STATUSES`, `BOOT_INTERVAL`), Heartbeat and StatusNotification (connector, status, error code and timestamp logged, empty result), Authorize, StartTransaction and StopTransaction (every idTag Accepted, except those in `BLOCKED_ID_TAGS`, Blocked in both, and in `START_REJECTED_ID_TAGS`, Blocked only in StartTransaction; compared without regard to case; transaction IDs from 1; a StopTransaction for an unknown or closed transaction gets an ordinary answer and a warning); logs the close code of a disconnected charge point. |
+| `csms/` | Python test CSMS on the `ocpp` library. Answers BootNotification (status sequence and interval configurable through `BOOT_STATUSES`, `BOOT_INTERVAL`), Heartbeat and StatusNotification (connector, status, error code and timestamp logged, empty result), Authorize, StartTransaction and StopTransaction (every idTag Accepted, except those in `BLOCKED_ID_TAGS`, Blocked in both, and in `START_REJECTED_ID_TAGS`, Blocked only in StartTransaction; compared without regard to case; transaction IDs from 1; a StopTransaction for an unknown or closed transaction gets an ordinary answer and a warning) and MeterValues (each value logged; a warning for an unknown transaction, an energy register that goes down, or a meterStop below the last sampled register; always an ordinary answer); logs the close code of a disconnected charge point. |
 
 ## Modules of `cp-sim`
 
@@ -28,10 +28,10 @@ Layered from the wire up; each module uses only the ones above it.
 | `pending` | `PendingCalls`: outstanding CALLs by message ID, each waiting on a `oneshot` channel. | No. |
 | `client` | One WebSocket connection: `Client::call` sends a typed request and waits for the typed answer; the reader task routes incoming frames; `Client::close` sends a Close frame with a status code. | Partly: sub-protocol `ocpp1.6`, `ocpp16::Request`. |
 | `boot` | Maps a BootNotification response to the next step (Accepted, Pending, Rejected). | Yes, 1.6 section 4.2. |
-| `transaction16` | 1.6 transactions: `IdTag` (1 to 20 characters), `Transaction` (ID from the CSMS, idTag, meter at the start), the Authorize, StartTransaction and StopTransaction requests, and what an answer means (`authorized`, `on_start_conf`: charge or stop with DeAuthorized; the `reason` and `idTag` of a stop). Pure. Behaves as if `StopTransactionOnInvalidId` and `StopTransactionOnEVSideDisconnect` were true. | Yes. |
+| `transaction16` | 1.6 transactions: `IdTag` (1 to 20 characters), `Transaction` (ID from the CSMS, idTag, meter at the start), the Authorize, StartTransaction, StopTransaction and MeterValues requests (`sample`: the energy register in Wh, sampled periodically), and what an answer means (`authorized`, `on_start_conf`: charge or stop with DeAuthorized; the `reason` and `idTag` of a stop). Pure. Behaves as if `StopTransactionOnInvalidId` and `StopTransactionOnEVSideDisconnect` were true, `MeterValuesSampledData` were its default and `StopTxnSampledData`/`StopTxnAlignedData` were empty (no `transactionData`). | Yes. |
 | `status16` | Maps a connector state and the instant it was reached to a 1.6 StatusNotification request; `report` builds the list sent after Accepted and after a reconnect (errata 3.22): connector 0, then every connector. Connector 0 is not representable by `status_notification`. | Yes, through `connector` and `ocpp16`. |
 | `backoff` | Wait before a reconnect, OCPP-J 2.0.1 part 4 section 5.4. | No, a transport rule. |
-| `session` | Stays connected until a shutdown signal: connect, boot until Accepted, report the status of connector 0 and the connector, apply keyboard commands and report each one, start and stop transactions, Heartbeat, reconnect; on the signal, close the connection and return. Owns the state that survives a connection (`Station`: connector, meter, open transaction, undelivered StopTransaction). | Yes, through `boot`, `transaction16` and `ocpp16`. |
+| `session` | Stays connected until a shutdown signal: connect, boot until Accepted, report the status of connector 0 and the connector, apply keyboard commands and report each one, start and stop transactions, sample the meter during a transaction (MeterValues every `meter_sample_interval`, 10 s in `main`), Heartbeat, reconnect; on the signal, close the connection and return. Owns the state that survives a connection (`Station`: connector, meter, open transaction and its sampler, undelivered StopTransaction). | Yes, through `boot`, `transaction16` and `ocpp16`. |
 | `logging` | Installs the global `tracing` subscriber: events to stderr, filter from `RUST_LOG`, default `cp_sim=debug`; a malformed `RUST_LOG` is a startup error. Called first in `main`. | No. |
 | `main` | Starts logging, reads the CSMS URL, rejects a malformed one, fixes the settings, creates the input channel and starts the keyboard thread (`keyboard::spawn`), runs `session::run` until Ctrl+C or SIGTERM. | Boot payload is 1.6. |
 | `test_support` | Tests only: `FakeCsms`, a WebSocket server driven by the test; `LogCapture`, which collects the log events of the test's thread as text. | 1.6 sub-protocol. |
@@ -49,9 +49,11 @@ not a pre-formatted string.
   (connected, boot accepted, reconnecting, a connector changed state,
   transaction started with `transaction_id`, `id_tag`, `meter_start`,
   transaction stopped with `transaction_id`, `meter_stop`, `energy_wh`,
-  `reason`, shutting down).
+  `reason`, meter sampled with `transaction_id`, `register_wh`, shutting
+  down).
 - `warn`: a failure that the program survives (a CALL that failed, a
-  StopTransaction that will be retried, a malformed frame, no connection).
+  StopTransaction that will be retried, a meter sample interval too large to
+  use, a malformed frame, no connection).
 
 The replies to what the owner types on the keyboard are not log events and
 stay `eprintln!` (`#[expect]` says so at each place), so a filter such as
@@ -124,6 +126,18 @@ Transactions (OCPP 1.6 sections 3.7, 4.1, 4.8, 4.10, errata 3.17):
    after every reconnect, before the status reports, and after a CALLERROR
    or timeout again on every Heartbeat tick, whatever the Heartbeat's
    outcome. Until it is cleared, `start` is refused.
+6. While a transaction is open (Charging, and Faulted with the meter
+   paused), the `sampler` ticks every `meter_sample_interval`, the first
+   time one interval after the start: MeterValues with the register at that
+   moment and the wall-clock time. The keep-alive loop polls its branches in
+   a fixed order (`biased`: Heartbeat, input, sample, end of connection), so
+   an input that waited while a CALL kept the loop busy is applied before an
+   overdue sample, and a sample never carries more energy than the
+   meterStop of a `stop` typed before it. Ticks missed while busy or
+   offline give one sample when the loop polls the sampler again, then the
+   next one a full interval later. Samples are not taken offline, and a
+   failed MeterValues is not retried (step 5c). Zero, or an interval too
+   large to add to the clock, turns sampling off.
 
 Connection life cycle (`session`): connect → BootNotification until
 Accepted → the undelivered StopTransaction, if any → status reports
@@ -172,14 +186,17 @@ does not check that a test still means what the row says; review does.
 | Every frame on the wire is logged at `debug` with its direction (`out` or `in`) and text. | `client::frames_are_logged_with_their_direction` |
 | A connector state change is logged at `info` with the connector, the old and the new state as fields. | `session::state_change_is_logged_with_its_fields` |
 | `RUST_LOG` overrides the default filter; blank means the default; a malformed value stops the program at startup and names the value. | `logging::default_filter_logs_debug_of_this_crate`, `logging::blank_value_means_the_default`, `logging::rust_log_overrides_the_default`, `logging::malformed_directives_are_an_error` |
-| On shutdown the client closes an open connection with 1001 Going Away and does not wait for a CALL in flight. An open transaction is not stopped and an undelivered StopTransaction is lost (backlog). | `session::shutdown_closes_connection_and_returns`, `session::shutdown_during_boot_call_closes_connection`, `session::shutdown_during_heartbeat_call_closes_connection`, `session::shutdown_during_report_closes_connection`, `session::shutdown_during_status_notification_closes_connection`, `session::shutdown_during_authorize_closes_connection`, `session::shutdown_during_start_transaction_closes_connection`, `session::shutdown_during_stop_transaction_closes_connection` |
+| On shutdown the client closes an open connection with 1001 Going Away and does not wait for a CALL in flight. An open transaction is not stopped and an undelivered StopTransaction is lost (backlog). | `session::shutdown_closes_connection_and_returns`, `session::shutdown_during_boot_call_closes_connection`, `session::shutdown_during_heartbeat_call_closes_connection`, `session::shutdown_during_report_closes_connection`, `session::shutdown_during_status_notification_closes_connection`, `session::shutdown_during_authorize_closes_connection`, `session::shutdown_during_start_transaction_closes_connection`, `session::shutdown_during_stop_transaction_closes_connection`, `session::shutdown_during_meter_values_closes_connection` |
 | A keyboard command is applied only after Accepted. On a live connection a valid command other than `start` sends one StatusNotification carrying the instant it was typed (after the StopTransaction, if it ends a transaction); a command that does not fit sends nothing and changes nothing; commands that waited are applied in order and reported once, with the instant of the last one. | `session::input_sends_status_notification`, `session::invalid_event_sends_nothing`, `session::fault_reports_the_error_code_and_clear_returns_to_the_pre_fault_state`, `session::inputs_wait_until_boot_is_accepted`, `session::inputs_while_offline_are_reported_once_with_the_time_of_the_last_one`, `session::connection_lost_during_an_input_report_reports_the_new_state_again` |
 | The connector charges only in a transaction the CSMS has answered, and only for an idTag it authorized: `start` sends Authorize, then StartTransaction, then StatusNotification Charging; a refused idTag, a `start` outside Preparing, an invalid idTag or a `start` typed offline sends nothing more. | `session::start_authorizes_then_starts_the_transaction_then_charges`, `session::a_refused_id_tag_starts_nothing`, `session::start_outside_preparing_sends_nothing`, `session::an_invalid_id_tag_sends_nothing`, `session::start_while_offline_is_ignored`, `transaction16::only_accepted_is_authorized` |
 | A failed or lost Authorize or StartTransaction starts no transaction and leaves the connector in Preparing; a CALLERROR or timeout keeps the connection. | `session::connection_lost_during_authorize_starts_no_transaction`, `session::connection_lost_during_start_transaction_starts_no_transaction`, `session::authorize_call_error_keeps_connection`, `session::authorize_timeout_keeps_connection`, `session::start_transaction_call_error_keeps_connection`, `session::start_transaction_timeout_keeps_connection` |
 | `stop` ends the transaction with the idTag and no reason, unplugging while charging with reason EVDisconnected; a fault keeps it. `meterStop` is the meter at that instant: energy flows only while Charging. | `session::stop_ends_the_transaction_with_the_meter_reading`, `session::unplug_while_charging_ends_the_transaction_as_ev_disconnected`, `session::a_fault_keeps_the_transaction_and_its_time_is_not_charged`, `session::the_transaction_survives_a_reconnect`, `transaction16::a_stop_by_the_user_carries_the_id_tag_and_no_reason`, `transaction16::a_stop_by_the_station_has_a_reason_and_no_id_tag`, `meter::a_pause_adds_nothing_and_fractions_are_kept` |
 | A StartTransaction.conf that does not accept the idTag stops the transaction with reason DeAuthorized; the stop is applied before any report is sent, so a lost connection cannot leave it running. | `session::a_start_conf_not_accepted_stops_the_transaction_as_deauthorized`, `session::connection_lost_after_a_deauthorized_start_still_stops_the_transaction`, `transaction16::a_start_conf_not_accepted_stops_the_transaction` |
 | A StopTransaction stays until the CSMS answers it: after a lost connection it goes out first on the next one; after a CALLERROR or timeout the status still goes out and the StopTransaction again on every Heartbeat tick, even when the Heartbeat fails; until then `start` is refused. | `session::connection_lost_during_stop_transaction_sends_it_again`, `session::stop_while_offline_is_sent_first_after_the_reconnect`, `session::stop_transaction_call_error_is_retried_after_the_heartbeat`, `session::stop_transaction_timeout_is_retried_after_the_heartbeat`, `session::stop_transaction_is_retried_even_when_the_heartbeat_fails`, `session::start_is_refused_until_the_stop_is_delivered` |
-| A transaction start and stop are logged at `info` with their fields. | `session::a_started_transaction_is_logged_with_its_fields`, `session::a_stopped_transaction_is_logged_with_its_fields` |
+| A transaction start, stop and meter sample are logged at `info` with their fields. | `session::a_started_transaction_is_logged_with_its_fields`, `session::a_stopped_transaction_is_logged_with_its_fields`, `session::a_sample_is_logged_with_its_fields` |
+| During a transaction, and only then, MeterValues carry the energy register of the transaction every interval, the first one interval after the start; a fault keeps sampling with the frozen register; zero turns sampling off and never reaches the tokio interval, nor does an interval that overflows the clock. | `session::meter_values_are_sent_every_interval_during_a_transaction`, `session::the_first_sample_comes_one_interval_after_the_start`, `session::no_meter_values_without_a_transaction`, `session::meter_values_stop_with_the_transaction`, `session::a_deauthorized_start_sends_no_meter_values`, `session::meter_values_during_a_fault_carry_the_frozen_reading`, `session::zero_sample_interval_sends_no_meter_values`, `session::no_sampler_for_zero_or_an_overflowing_period`, `transaction16::a_sample_carries_the_register_of_the_transaction` |
+| An input waiting when a sample is due is applied first, so a sample never carries more than the following meterStop. | `session::a_waiting_stop_goes_before_the_next_sample` |
+| Missed sample ticks give one sample, not a burst; a failed or lost MeterValues keeps the connection or the sampling going with the same transaction. | `session::skipped_ticks_while_offline_send_one_sample`, `session::meter_values_call_error_keeps_connection_and_sampling`, `session::connection_lost_during_meter_values_keeps_sampling` |
 | The end of the keyboard input does not stop the station or make it spin. | `session::heartbeats_continue_after_the_sender_is_dropped` |
 | The keyboard reader skips a bad line, also one that is not UTF-8, and ends on a read error or when the session is gone. | `keyboard::a_line_that_is_not_utf8_is_skipped_and_reading_goes_on`, `keyboard::a_read_error_ends_the_reader`, `keyboard::a_dropped_receiver_ends_the_reader_after_the_first_line` |
 | Shutdown never waits for a back-off, the wait after Rejected or a connect timeout. | `session::shutdown_during_backoff_returns_at_once`, `session::shutdown_during_rejected_wait_returns_at_once`, `session::shutdown_during_connect_returns_at_once` |
@@ -211,4 +228,8 @@ belongs to the version module, not to `session`. The same goes for
 `Station` (`Transaction`, `pending_stop`, both from `transaction16`) is
 1.6 too: 2.0.1 replaces it with its own, built on TransactionEvent, where
 the station chooses a string `transactionId`. `meter` and the shared
-`connector` state stay.
+`connector` state stay. So do the sampler and `meter_sample_interval`: in
+2.0.1 the same timer drives TransactionEvent(Updated) with
+`SampledDataTxUpdatedInterval`, while the MeterValues message
+(`transaction16::sample`) and the key name `MeterValueSampleInterval` are
+1.6.
