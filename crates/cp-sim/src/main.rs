@@ -50,6 +50,9 @@ const SETTINGS: Settings = Settings {
     },
     boot_retry: boot::DEFAULT_BOOT_RETRY,
     close_timeout: Duration::from_secs(5),
+    // MeterValueSampleInterval. Real stations use 1 to 5 minutes (1.6
+    // section 3.16.1); 10 s shows the progress quickly when trying it out.
+    meter_sample_interval: Duration::from_secs(10),
 };
 
 #[tokio::main]

@@ -6,7 +6,8 @@
 //! the state of the connector; each one on a live connection is reported at
 //! once. `start` presents an idTag and begins a transaction when the CSMS
 //! accepts it (Authorize, StartTransaction); `stop` and unplugging the
-//! cable while charging end it (StopTransaction).
+//! cable while charging end it (StopTransaction). While a transaction is
+//! open, the meter is sampled every `meter_sample_interval` (MeterValues).
 
 use std::{num::NonZeroU32, time::Duration};
 
@@ -15,7 +16,7 @@ use time::UtcDateTime;
 use tokio::{
     sync::mpsc,
     task::JoinHandle,
-    time::{MissedTickBehavior, interval, sleep, timeout},
+    time::{Instant, Interval, MissedTickBehavior, interval, interval_at, sleep, timeout},
 };
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tracing::{info, warn};
@@ -49,6 +50,11 @@ pub struct Settings {
     /// How long to wait for the server to answer our Close frame before
     /// dropping the connection.
     pub close_timeout: Duration,
+    /// Time between two samples of the meter during a transaction, counted
+    /// from its start; zero sends none. `MeterValueSampleInterval` in 1.6
+    /// (section 3.16.1), `SampledDataTxUpdatedInterval` of TransactionEvent
+    /// in 2.0.1.
+    pub meter_sample_interval: Duration,
 }
 
 /// Runs the charge point until `shutdown` completes.
@@ -93,6 +99,7 @@ pub async fn run(
         connectors: vec![Connector::new(CONNECTOR_ID, started)],
         meter: Meter::new(),
         transaction: None,
+        sampler: None,
         pending_stop: None,
         inputs: Some(inputs),
         backoff: Backoff::new(settings.backoff),
@@ -172,6 +179,10 @@ struct Station<'a> {
     /// The transaction on the connector, once the CSMS has answered
     /// StartTransaction. It survives a lost connection.
     transaction: Option<Transaction>,
+    /// Ticks when the meter of the open transaction is due to be sampled;
+    /// `None` without a transaction or with sampling off. Like the
+    /// transaction, it survives a lost connection.
+    sampler: Option<Interval>,
     /// The StopTransaction of an ended transaction until the CSMS has
     /// answered it. The transaction ends on the station at once; the
     /// message is transaction-related and must reach the CSMS (section
@@ -196,6 +207,29 @@ async fn next_input(inputs: &mut Option<mpsc::Receiver<Input>>) -> Input {
         *inputs = None;
     }
     std::future::pending().await
+}
+
+/// Waits for the next sample tick; forever if there is no sampler.
+/// `Interval::tick` is cancel-safe, so `select!` may drop this future.
+async fn next_sample(sampler: &mut Option<Interval>) {
+    match sampler {
+        Some(sampler) => {
+            sampler.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// When the first sample of a transaction that starts `now` is due: one
+/// `period` later (section 3.16.1: "from the start of the charging
+/// transaction"). `None` when sampling is off (zero, which would also make
+/// the tokio interval panic) or when the instant does not exist (a period so
+/// large that adding it overflows, which would panic as well).
+fn first_sample(now: Instant, period: Duration) -> Option<Instant> {
+    if period.is_zero() {
+        return None;
+    }
+    now.checked_add(period)
 }
 
 /// Why a connection ended.
@@ -290,7 +324,13 @@ impl Station<'_> {
             return ended;
         }
         loop {
+            // `biased`: the branches are polled in this order, not at random.
+            // An input that is already waiting when a sample is due (because
+            // a CALL kept the loop busy) is applied first: a `stop` typed
+            // before the sample must not be reported after it, or the sample
+            // would carry more energy than the following meterStop.
             tokio::select! {
+                biased;
                 _ = ticker.tick() => {
                     match client.call(&HeartbeatRequest {}).await {
                         Ok(_) => self.backoff.reset(),
@@ -309,6 +349,11 @@ impl Station<'_> {
                 // so the handler may use `self` again.
                 input = next_input(&mut self.inputs) => {
                     if let Err(ended) = self.handle(client, input).await {
+                        return ended;
+                    }
+                }
+                () = next_sample(&mut self.sampler) => {
+                    if let Err(ended) = self.send_sample(client).await {
                         return ended;
                     }
                 }
@@ -348,6 +393,48 @@ impl Station<'_> {
             ),
         }
         Ok(())
+    }
+
+    /// Samples the meter of the open transaction now and sends it
+    /// (MeterValues). A failure that leaves the connection up is logged and
+    /// not retried: the next sample carries the newer reading. Samples that
+    /// fall while the station is offline are not taken; section 3.7 wants
+    /// them queued, which is step 5c. After a reconnect, a sample that was
+    /// due goes out once, not one per missed tick.
+    async fn send_sample(&mut self, client: &Client) -> Result<(), Ended> {
+        let Some(transaction) = &self.transaction else {
+            return Ok(());
+        };
+        let transaction_id = transaction.id;
+        let at = UtcDateTime::now();
+        let register_wh = self.meter.reading(at);
+        let request = transaction16::sample(CONNECTOR_ID, transaction, register_wh, at);
+        match client.call(&request).await {
+            Ok(_) => {
+                self.backoff.reset();
+                info!(transaction_id, register_wh, "meter sampled");
+            }
+            Err(CallFailure::Disconnected) => return Err(Ended::Lost),
+            Err(err) => warn!(transaction_id, %err, "MeterValues failed"),
+        }
+        Ok(())
+    }
+
+    /// A sampler for a transaction that starts now, or `None` if sampling
+    /// is off. A tick missed while the station was busy or offline fires
+    /// once as soon as it is polled, and the next one comes a full period
+    /// later (`Delay`), so a reconnect does not send a burst of samples.
+    fn new_sampler(&self) -> Option<Interval> {
+        let period = self.settings.meter_sample_interval;
+        let Some(first) = first_sample(Instant::now(), period) else {
+            if !period.is_zero() {
+                warn!(?period, "meter sample interval too large, no MeterValues");
+            }
+            return None;
+        };
+        let mut sampler = interval_at(first, period);
+        sampler.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        Some(sampler)
     }
 
     /// Sends the waiting StopTransaction, if any, and forgets it once the
@@ -526,7 +613,10 @@ impl Station<'_> {
         });
         let charging = self.apply(Event::StartCharging, at);
         let stopped = match transaction16::on_start_conf(&response) {
-            StartDecision::Charge => None,
+            StartDecision::Charge => {
+                self.sampler = self.new_sampler();
+                None
+            }
             StartDecision::StopDeAuthorized => {
                 eprintln!(
                     "the CSMS did not accept the idTag in StartTransaction ({:?}): \
@@ -559,6 +649,7 @@ impl Station<'_> {
         let Some(transaction) = self.transaction.take() else {
             return;
         };
+        self.sampler = None;
         let meter_stop = self.meter.reading(at);
         let request = transaction16::stop(&transaction, cause, meter_stop, at);
         info!(
@@ -712,6 +803,9 @@ mod tests {
             // Long, so a quick shutdown proves that the server answered our
             // Close instead of `disconnect` giving up on it.
             close_timeout: LONG,
+            // Off, so MeterValues do not get between the frames that the
+            // other tests expect; the sampling tests turn it on.
+            meter_sample_interval: Duration::ZERO,
         }
     }
 
@@ -1388,7 +1482,12 @@ mod tests {
 
     /// `T0 + offset` as it appears on the wire.
     fn wire_time(offset: i64) -> String {
-        crate::timestamp::rfc3339(UtcDateTime::from_unix_timestamp(T0 + offset).unwrap()).unwrap()
+        wire(T0 + offset)
+    }
+
+    /// The instant `unix` as it appears on the wire.
+    fn wire(unix: i64) -> String {
+        crate::timestamp::rfc3339(UtcDateTime::from_unix_timestamp(unix).unwrap()).unwrap()
     }
 
     /// The next event must be a CALL of `action`; returns its ID and payload.
@@ -1419,21 +1518,37 @@ mod tests {
 
     /// `plug` at T0, answered.
     async fn plug_in(csms: &mut FakeCsms, inputs: &mpsc::Sender<Input>) {
-        inputs.send(input(Command::Plug, T0)).await.unwrap();
-        expect_report(csms, report_at(1, "Preparing", "NoError", &wire_time(0))).await;
+        plug_in_at(csms, inputs, T0).await;
+    }
+
+    async fn plug_in_at(csms: &mut FakeCsms, inputs: &mpsc::Sender<Input>, unix: i64) {
+        inputs.send(input(Command::Plug, unix)).await.unwrap();
+        expect_report(csms, report_at(1, "Preparing", "NoError", &wire(unix))).await;
     }
 
     /// `plug` at T0 and `start Card-42` at T0 + 60; the CSMS accepts the
     /// idTag and starts transaction `TX` with the meter at 0. Returns once
     /// the Charging report is answered.
     async fn start_charging(csms: &mut FakeCsms, inputs: &mpsc::Sender<Input>) {
-        plug_in(csms, inputs).await;
-        inputs.send(present(TAG, T0 + 60)).await.unwrap();
+        start_charging_from(csms, inputs, T0).await;
+    }
+
+    /// `start_charging` with `plug` at `base` and `start` at `base + 60`.
+    /// Returns the instant the StartTransaction answer was sent.
+    async fn start_charging_from(
+        csms: &mut FakeCsms,
+        inputs: &mpsc::Sender<Input>,
+        base: i64,
+    ) -> Instant {
+        plug_in_at(csms, inputs, base).await;
+        inputs.send(present(TAG, base + 60)).await.unwrap();
         let (id, _) = recv_call(csms, "Authorize").await;
         csms.send(authorize_result(&id, "Accepted"));
         let (id, _) = recv_call(csms, "StartTransaction").await;
         csms.send(start_result(&id, "Accepted"));
-        expect_report(csms, report_at(1, "Charging", "NoError", &wire_time(60))).await;
+        let answered = Instant::now();
+        expect_report(csms, report_at(1, "Charging", "NoError", &wire(base + 60))).await;
+        answered
     }
 
     #[tokio::test]
@@ -1942,6 +2057,381 @@ mod tests {
         }
     }
 
+    // --- MeterValues ---
+
+    /// The sample interval of the sampling tests: short, and not a divisor
+    /// of the 1 s Heartbeat, so the two rarely tick together.
+    const SAMPLE: Duration = Duration::from_millis(250);
+
+    fn sampling(call_timeout: Duration) -> Settings {
+        Settings {
+            meter_sample_interval: SAMPLE,
+            ..settings(call_timeout)
+        }
+    }
+
+    /// Now, in whole seconds, for commands in tests whose samples carry the
+    /// current time: the readings then stay small and consistent.
+    fn now_unix() -> i64 {
+        UtcDateTime::now().unix_timestamp()
+    }
+
+    /// Answers a CALL the way the tests that skip it expect.
+    fn answer(csms: &FakeCsms, action: &str, id: &str) {
+        match action {
+            "Heartbeat" => csms.send(heartbeat_result(id)),
+            _ => csms.send(empty_result(id)),
+        }
+    }
+
+    /// The next CALL whose action is not in `skip`; the skipped ones are
+    /// answered. Returns its action, ID and payload.
+    async fn recv_skipping(
+        csms: &mut FakeCsms,
+        skip: &[&str],
+    ) -> (String, String, serde_json::Value) {
+        loop {
+            match csms.recv_event_within(HEARTBEAT_WAIT).await {
+                Event::Frame(Frame::Call {
+                    id,
+                    action,
+                    payload,
+                }) => {
+                    if skip.contains(&action.as_str()) {
+                        answer(csms, &action, &id);
+                    } else {
+                        return (action, id, payload);
+                    }
+                }
+                other => panic!("expected a CALL, got {other:?}"),
+            }
+        }
+    }
+
+    /// The next MeterValues, Heartbeats answered on the way; returns its ID
+    /// and payload, unanswered.
+    async fn recv_sample(csms: &mut FakeCsms) -> (String, serde_json::Value) {
+        let (action, id, payload) = recv_skipping(csms, &["Heartbeat"]).await;
+        assert_eq!(action, "MeterValues", "payload: {payload}");
+        (id, payload)
+    }
+
+    /// Answers every CALL for `wait` and fails on a MeterValues.
+    async fn assert_no_sample_within(csms: &mut FakeCsms, wait: Duration) {
+        let deadline = Instant::now() + wait;
+        while let Some(frame) = csms.recv_within(deadline - Instant::now()).await {
+            match frame {
+                Frame::Call { action, .. } if action == "MeterValues" => {
+                    panic!("unexpected MeterValues")
+                }
+                Frame::Call { id, action, .. } => answer(csms, &action, &id),
+                other => panic!("expected a CALL, got {other:?}"),
+            }
+        }
+    }
+
+    /// The one value of a sample of transaction `TX`, checked to be the
+    /// energy register in Wh, sampled periodically on connector 1.
+    /// Returns the value and the time of the sample.
+    fn sample_value(payload: &serde_json::Value) -> (u64, String) {
+        assert_eq!(payload["connectorId"], 1);
+        assert_eq!(payload["transactionId"], TX);
+        let meter_values = payload["meterValue"].as_array().unwrap();
+        assert_eq!(meter_values.len(), 1, "{payload}");
+        let sampled = meter_values[0]["sampledValue"].as_array().unwrap();
+        assert_eq!(sampled.len(), 1, "{payload}");
+        assert_eq!(sampled[0]["measurand"], "Energy.Active.Import.Register");
+        assert_eq!(sampled[0]["unit"], "Wh");
+        assert_eq!(sampled[0]["context"], "Sample.Periodic");
+        let value = sampled[0]["value"].as_str().unwrap().parse().unwrap();
+        let at = meter_values[0]["timestamp"].as_str().unwrap().to_owned();
+        (value, at)
+    }
+
+    /// The register `started` seconds of charging give at 7400 W, as the
+    /// meter reads it at the time the sample `at` shows. The instant is
+    /// found by matching its text, which avoids parsing.
+    fn expected_reading(started: i64, at: &str) -> u64 {
+        let now = now_unix();
+        let unix = (now - 10..=now + 1)
+            .find(|&unix| wire(unix) == at)
+            .unwrap_or_else(|| panic!("sample time {at} is not around now"));
+        let seconds = u64::try_from(unix - started).unwrap();
+        crate::meter::POWER_W * seconds / 3600
+    }
+
+    #[tokio::test]
+    async fn meter_values_are_sent_every_interval_during_a_transaction() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, sampling(LONG));
+        connect_and_accept(&mut csms).await;
+        let base = now_unix() - 120;
+        start_charging_from(&mut csms, &inputs, base).await;
+
+        let mut arrivals = Vec::new();
+        for _ in 0..2 {
+            let (id, payload) = recv_sample(&mut csms).await;
+            arrivals.push(Instant::now());
+            // The register that matches the time the sample carries.
+            let (value, at) = sample_value(&payload);
+            assert_eq!(value, expected_reading(base + 60, &at), "{payload}");
+            csms.send(empty_result(&id));
+        }
+        let gap = arrivals[1] - arrivals[0];
+        assert!(gap >= SAMPLE * 4 / 5, "samples too close: {gap:?}");
+    }
+
+    #[tokio::test]
+    async fn the_first_sample_comes_one_interval_after_the_start() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, sampling(LONG));
+        connect_and_accept(&mut csms).await;
+        let answered = start_charging_from(&mut csms, &inputs, now_unix() - 120).await;
+
+        recv_sample(&mut csms).await;
+        let after = answered.elapsed();
+        assert!(after >= SAMPLE, "first sample after {after:?}");
+    }
+
+    #[tokio::test]
+    async fn no_meter_values_without_a_transaction() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, sampling(LONG));
+        connect_and_accept(&mut csms).await;
+        plug_in(&mut csms, &inputs).await;
+
+        assert_no_sample_within(&mut csms, 4 * SAMPLE).await;
+    }
+
+    #[tokio::test]
+    async fn zero_sample_interval_sends_no_meter_values() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        start_charging_from(&mut csms, &inputs, now_unix() - 120).await;
+
+        assert_no_sample_within(&mut csms, 4 * SAMPLE).await;
+    }
+
+    #[tokio::test]
+    async fn meter_values_stop_with_the_transaction() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, sampling(LONG));
+        connect_and_accept(&mut csms).await;
+        let base = now_unix() - 120;
+        start_charging_from(&mut csms, &inputs, base).await;
+        let (id, _) = recv_sample(&mut csms).await;
+        csms.send(empty_result(&id));
+
+        inputs.send(input(Command::Stop, now_unix())).await.unwrap();
+        let (action, id, _) = recv_skipping(&mut csms, &["Heartbeat", "MeterValues"]).await;
+        assert_eq!(action, "StopTransaction");
+        csms.send(empty_result(&id));
+        let (action, id, payload) = recv_skipping(&mut csms, &["Heartbeat"]).await;
+        assert_eq!(action, "StatusNotification");
+        assert_eq!(payload["status"], "Finishing");
+        csms.send(empty_result(&id));
+
+        assert_no_sample_within(&mut csms, 4 * SAMPLE).await;
+    }
+
+    #[tokio::test]
+    async fn a_deauthorized_start_sends_no_meter_values() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, sampling(LONG));
+        connect_and_accept(&mut csms).await;
+        start_refused_in_start_transaction(&mut csms, &inputs).await;
+        // Charging, StopTransaction, Finishing.
+        for expected in [
+            "StatusNotification",
+            "StopTransaction",
+            "StatusNotification",
+        ] {
+            let (action, id, _) = recv_skipping(&mut csms, &["Heartbeat"]).await;
+            assert_eq!(action, expected);
+            csms.send(empty_result(&id));
+        }
+
+        assert_no_sample_within(&mut csms, 4 * SAMPLE).await;
+    }
+
+    #[tokio::test]
+    async fn meter_values_during_a_fault_carry_the_frozen_reading() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, sampling(LONG));
+        connect_and_accept(&mut csms).await;
+        // Charging since `fault_at - 60`, faulted at `fault_at`: 60 s of
+        // energy, 7400 · 60 / 3600 = 123.33 Wh, read as 123. The fault goes
+        // out before the first sample is due.
+        let fault_at = now_unix();
+        start_charging_from(&mut csms, &inputs, fault_at - 120).await;
+        let fault = input(Command::Fault(Fault::OverCurrent), fault_at);
+        inputs.send(fault).await.unwrap();
+        let (action, id, payload) = recv_skipping(&mut csms, &["Heartbeat"]).await;
+        assert_eq!(action, "StatusNotification", "{payload}");
+        assert_eq!(payload["status"], "Faulted");
+        csms.send(empty_result(&id));
+
+        // The transaction is still open, so samples go on, with the energy
+        // of the charging time only.
+        for _ in 0..2 {
+            let (id, payload) = recv_sample(&mut csms).await;
+            assert_eq!(sample_value(&payload).0, 123, "{payload}");
+            csms.send(empty_result(&id));
+        }
+    }
+
+    #[tokio::test]
+    async fn meter_values_call_error_keeps_connection_and_sampling() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, sampling(LONG));
+        connect_and_accept(&mut csms).await;
+        start_charging_from(&mut csms, &inputs, now_unix() - 120).await;
+
+        let (id, _) = recv_sample(&mut csms).await;
+        csms.send(call_error(&id));
+        // The next sample, on the same connection (`recv_sample` panics on
+        // anything but a CALL).
+        let (id, payload) = recv_sample(&mut csms).await;
+        sample_value(&payload);
+        csms.send(empty_result(&id));
+    }
+
+    #[tokio::test]
+    async fn connection_lost_during_meter_values_keeps_sampling() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, sampling(LONG));
+        connect_and_accept(&mut csms).await;
+        let base = now_unix() - 120;
+        start_charging_from(&mut csms, &inputs, base).await;
+
+        recv_sample(&mut csms).await; // never answered
+        csms.close_connection();
+        reconnect_gap(&mut csms).await;
+
+        // The reports first, then the samples of the same transaction.
+        expect_report(&mut csms, report_payload(0)).await;
+        let charging = report_at(1, "Charging", "NoError", &wire(base + 60));
+        expect_report(&mut csms, charging).await;
+        let (id, payload) = recv_sample(&mut csms).await;
+        sample_value(&payload);
+        csms.send(empty_result(&id));
+    }
+
+    #[tokio::test]
+    async fn skipped_ticks_while_offline_send_one_sample() {
+        let mut csms = FakeCsms::start().await;
+        // Offline for at least 1 s, four sample intervals.
+        let mut settings = sampling(LONG);
+        settings.backoff.wait_minimum = Duration::from_secs(1);
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings);
+        connect_and_accept(&mut csms).await;
+        let base = now_unix() - 120;
+        start_charging_from(&mut csms, &inputs, base).await;
+        let (id, _) = recv_sample(&mut csms).await;
+        csms.send(empty_result(&id));
+
+        csms.close_connection();
+        let gap = reconnect_gap(&mut csms).await;
+        assert!(gap >= 4 * SAMPLE, "offline only {gap:?}");
+        expect_report(&mut csms, report_payload(0)).await;
+        let charging = report_at(1, "Charging", "NoError", &wire(base + 60));
+        expect_report(&mut csms, charging).await;
+
+        // One sample for the missed ticks, then the next a period later.
+        let (id, _) = recv_sample(&mut csms).await;
+        let first = Instant::now();
+        csms.send(empty_result(&id));
+        let (id, _) = recv_sample(&mut csms).await;
+        let between = first.elapsed();
+        csms.send(empty_result(&id));
+        assert!(between >= SAMPLE * 4 / 5, "a burst of samples: {between:?}");
+    }
+
+    #[tokio::test]
+    async fn a_waiting_stop_goes_before_the_next_sample() {
+        // A Heartbeat that hangs until its timeout (600 ms, over two sample
+        // intervals) keeps the loop busy; a `stop` typed meanwhile and the
+        // overdue sample are then both ready. The stop must go first.
+        // With the sample branch above the input it fails every time.
+        // Without `biased`, `select!` starts at a random branch, so a missing
+        // `biased` is caught only in some runs; three rounds raise the odds.
+        let mut csms = FakeCsms::start().await;
+        let call_timeout = Duration::from_millis(600);
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, sampling(call_timeout));
+        connect_and_accept(&mut csms).await;
+        let base = now_unix() - 120;
+        start_charging_from(&mut csms, &inputs, base).await;
+
+        for round in 0..3 {
+            // Wait for a Heartbeat, answering samples, and leave it hanging.
+            let (action, _, _) = recv_skipping(&mut csms, &["MeterValues"]).await;
+            assert_eq!(action, "Heartbeat", "round {round}");
+            inputs.send(input(Command::Stop, now_unix())).await.unwrap();
+
+            let (action, id, payload) = recv_skipping(&mut csms, &[]).await;
+            assert_eq!(action, "StopTransaction", "round {round}: {payload}");
+            csms.send(empty_result(&id));
+            let (action, id, _) = recv_skipping(&mut csms, &["Heartbeat"]).await;
+            assert_eq!(action, "StatusNotification", "round {round}");
+            csms.send(empty_result(&id));
+
+            // A new transaction for the next round.
+            for command in [Command::Unplug, Command::Plug] {
+                inputs.send(input(command, now_unix())).await.unwrap();
+                let (action, id, _) = recv_skipping(&mut csms, &["Heartbeat"]).await;
+                assert_eq!(action, "StatusNotification", "round {round}");
+                csms.send(empty_result(&id));
+            }
+            inputs.send(present(TAG, now_unix())).await.unwrap();
+            for (expected, reply) in [
+                ("Authorize", authorize_result as fn(&str, &str) -> Frame),
+                ("StartTransaction", start_result),
+            ] {
+                let (action, id, _) = recv_skipping(&mut csms, &["Heartbeat"]).await;
+                assert_eq!(action, expected, "round {round}");
+                csms.send(reply(&id, "Accepted"));
+            }
+            let (action, id, _) = recv_skipping(&mut csms, &["Heartbeat"]).await;
+            assert_eq!(action, "StatusNotification", "round {round}");
+            csms.send(empty_result(&id));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sample_is_logged_with_its_fields() {
+        let logs = LogCapture::start(EnvFilter::new("cp_sim=info"));
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, sampling(LONG));
+        connect_and_accept(&mut csms).await;
+        start_charging_from(&mut csms, &inputs, now_unix() - 120).await;
+        let (id, _) = recv_sample(&mut csms).await;
+        csms.send(empty_result(&id));
+        // The log line is written once the answer is in: wait for the next
+        // frame, which comes after it.
+        recv_sample(&mut csms).await;
+
+        let text = logs.text();
+        let line = text.lines().find(|l| l.contains("meter sampled"));
+        let line = line.unwrap_or_else(|| panic!("no sample in the log:\n{text}"));
+        for field in ["transaction_id=7", "register_wh="] {
+            assert!(line.contains(field), "{field} missing in: {line}");
+        }
+    }
+
+    #[test]
+    fn the_first_sample_is_one_period_after_the_start() {
+        let now = Instant::now();
+        assert_eq!(first_sample(now, SAMPLE), Some(now + SAMPLE));
+    }
+
+    #[test]
+    fn no_sampler_for_zero_or_an_overflowing_period() {
+        let now = Instant::now();
+        assert_eq!(first_sample(now, Duration::ZERO), None);
+        assert_eq!(first_sample(now, Duration::MAX), None);
+    }
+
     // --- Failed Heartbeat ---
 
     #[tokio::test]
@@ -2089,6 +2579,25 @@ mod tests {
     #[tokio::test]
     async fn shutdown_during_start_transaction_closes_connection() {
         shutdown_during_start("StartTransaction").await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_meter_values_closes_connection() {
+        let mut csms = FakeCsms::start().await;
+        let (stop, signal) = shutdown_signal();
+        let (inputs_tx, inputs) = mpsc::channel(8);
+        let cp = spawn_run_with(&csms.url, sampling(LONG), inputs, signal);
+        connect_and_accept(&mut csms).await;
+        start_charging_from(&mut csms, &inputs_tx, now_unix() - 120).await;
+        recv_sample(&mut csms).await; // never answered
+
+        stop.send(()).unwrap();
+        let took = time_to_stop(cp).await;
+        assert!(
+            took < Duration::from_secs(1),
+            "waited for the call: {took:?}"
+        );
+        assert_closed_with(&mut csms, 1001).await;
     }
 
     #[tokio::test]

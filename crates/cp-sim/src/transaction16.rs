@@ -14,15 +14,19 @@
 //!   `DeAuthorized` (errata 3.17);
 //! - `StopTransactionOnEVSideDisconnect` were true: unplugging the cable
 //!   while charging stops the transaction with reason `EVDisconnected`
-//!   (section 4.10).
+//!   (section 4.10);
+//! - `MeterValuesSampledData` were its default,
+//!   `Energy.Active.Import.Register` (section 9.1.17): a sample carries the
+//!   meter register and nothing else.
 
 use std::{fmt, num::NonZeroU32};
 
 use time::UtcDateTime;
 
 use crate::ocpp16::{
-    AuthorizationStatus, AuthorizeRequest, AuthorizeResponse, StartTransactionRequest,
-    StartTransactionResponse, StopReason, StopTransactionRequest,
+    AuthorizationStatus, AuthorizeRequest, AuthorizeResponse, Measurand, MeterValue,
+    MeterValuesRequest, ReadingContext, SampledValue, StartTransactionRequest,
+    StartTransactionResponse, StopReason, StopTransactionRequest, UnitOfMeasure,
 };
 
 /// An idTag (1.6 section 3.9): the identifier of the user, such as the
@@ -186,6 +190,36 @@ fn reason(cause: StopCause) -> Option<StopReason> {
     }
 }
 
+/// MeterValues for `transaction` on `connector`: the meter register,
+/// `reading_wh`, sampled at `at` (section 3.16.1, sampled meter data).
+///
+/// Measurand, unit and context are written out although they are the
+/// defaults of section 4.7, so a CSMS need not know the defaults to read
+/// the value.
+pub fn sample(
+    connector: NonZeroU32,
+    transaction: &Transaction,
+    reading_wh: u64,
+    at: UtcDateTime,
+) -> MeterValuesRequest {
+    MeterValuesRequest {
+        connector_id: connector.get(),
+        transaction_id: Some(transaction.id),
+        meter_value: vec![MeterValue {
+            timestamp: at,
+            sampled_value: vec![SampledValue {
+                value: reading_wh.to_string(),
+                context: Some(ReadingContext::SamplePeriodic),
+                format: None,
+                measurand: Some(Measurand::EnergyActiveImportRegister),
+                phase: None,
+                location: None,
+                unit: Some(UnitOfMeasure::Wh),
+            }],
+        }],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,5 +354,26 @@ mod tests {
             assert_eq!(request.transaction_id, 7);
             assert_eq!(request.meter_stop, 100);
         }
+    }
+
+    #[test]
+    fn a_sample_carries_the_register_of_the_transaction() {
+        let request = sample(ONE, &transaction(), 246, AT);
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "connectorId": 1,
+                "transactionId": 7,
+                "meterValue": [{
+                    "timestamp": "1970-01-01T00:00:00Z",
+                    "sampledValue": [{
+                        "value": "246",
+                        "context": "Sample.Periodic",
+                        "measurand": "Energy.Active.Import.Register",
+                        "unit": "Wh",
+                    }],
+                }],
+            })
+        );
     }
 }

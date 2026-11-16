@@ -64,15 +64,20 @@ instead.
          undelivered StopTransaction kept and retried (`pending_stop`), CSMS
          handlers.
          [#17](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/17)
-   - [ ] **5b.** Periodic MeterValues during a transaction
-         (`MeterValueSampleInterval`, errata 3.15); decide on
-         `transactionData` in StopTransaction (errata 3.14).
+   - [x] **5b.** Periodic MeterValues during a transaction
+         (`MeterValueSampleInterval`, 10 s, errata 3.15) with the energy
+         register; no `transactionData` in StopTransaction (as if
+         `StopTxnSampledData` and `StopTxnAlignedData` were empty, section
+         3.16.5).
+         [#18](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/18)
    - [ ] **5c.** A queue of transaction-related messages with
          `TransactionMessageAttempts` and `TransactionMessageRetryInterval`
          (section 3.7), and a transaction whose ID is not known yet
          (errata 3.18, `transactionId` -1). This changes the 5a model, where
          a transaction exists only once StartTransaction is answered, and
-         the 5a tests that rely on it.
+         the 5a tests that rely on it. MeterValues belong in the queue too:
+         since 5b, samples due while offline are not taken, and a failed
+         MeterValues is not retried.
 
 ## Hardware and system track
 
@@ -159,7 +164,19 @@ Found during the migration inventory; carried over as is
       (section 3.10), `ConcurrentTx`.
 - [ ] Configuration keys (`GetConfiguration`, `ChangeConfiguration`):
       `StopTransactionOnInvalidId`, `StopTransactionOnEVSideDisconnect`,
-      `MeterValueSampleInterval` are constants today (step 5a).
+      `MeterValueSampleInterval` are constants today (steps 5a, 5b). An
+      interval from the CSMS must be checked like `interval = 0`: zero and
+      huge values already turn sampling off instead of panicking.
+- [ ] `transactionData` in StopTransaction (`StopTxnSampledData`,
+      `StopTxnAlignedData`; errata 3.14 recommends the Transaction.Begin and
+      Transaction.End values of every configured measurand). Step 5b leaves
+      it out.
+- [ ] Clock-aligned meter values (`ClockAlignedDataInterval`,
+      `MeterValuesAlignedData`, section 3.16.2), for example every 15
+      minutes from midnight.
+- [ ] More measurands in MeterValues (`Power.Active.Import`,
+      `Current.Import`, `Voltage`, `SoC`), phases and locations, and the main
+      meter on connector 0; today a sample carries only the energy register.
 - [ ] Real energy measurement instead of the constant 7.4 kW of `meter`:
       a current and voltage sensor on the Pi (hardware track).
 - [ ] `MinimumStatusDuration` (1.6 section 4.9): do not report a status
