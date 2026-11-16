@@ -8,6 +8,8 @@
 //! accepts it (Authorize, StartTransaction); `stop` and unplugging the
 //! cable while charging end it (StopTransaction). While a transaction is
 //! open, the meter is sampled every `meter_sample_interval` (MeterValues).
+//! StopTransaction and MeterValues go through a queue that keeps their order
+//! and retries them (section 3.7, `tx_queue`).
 
 use std::{num::NonZeroU32, time::Duration};
 
@@ -16,7 +18,9 @@ use time::UtcDateTime;
 use tokio::{
     sync::mpsc,
     task::JoinHandle,
-    time::{Instant, Interval, MissedTickBehavior, interval, interval_at, sleep, timeout},
+    time::{
+        Instant, Interval, MissedTickBehavior, interval, interval_at, sleep, sleep_until, timeout,
+    },
 };
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tracing::{info, warn};
@@ -28,12 +32,10 @@ use crate::{
     connector::{Connector, Event, State},
     keyboard::{Command, Input},
     meter::Meter,
-    ocpp16::{
-        BootNotificationRequest, HeartbeatRequest, StatusNotificationRequest,
-        StopTransactionRequest,
-    },
+    ocpp16::{BootNotificationRequest, HeartbeatRequest, StatusNotificationRequest},
     status16,
-    transaction16::{self, IdTag, StartDecision, StopCause, Transaction},
+    transaction16::{self, IdTag, StartDecision, StopCause, Transaction, TxMessage},
+    tx_queue::{Failure, TxQueue},
 };
 
 /// The one connector of the simulated charge point.
@@ -55,6 +57,17 @@ pub struct Settings {
     /// (section 3.16.1), `SampledDataTxUpdatedInterval` of TransactionEvent
     /// in 2.0.1.
     pub meter_sample_interval: Duration,
+    /// Transmissions of a transaction-related message at most, when the
+    /// CSMS fails to process it (`TransactionMessageAttempts`, section
+    /// 3.7.1); 0 counts as 1.
+    pub transaction_attempts: u32,
+    /// Wait before sending a failed transaction-related message again, times
+    /// the transmissions so far (`TransactionMessageRetryInterval`).
+    pub transaction_retry_interval: Duration,
+    /// MeterValues that may wait in the queue at most; when a new sample
+    /// comes, the oldest waiting one is dropped (0 counts as 1). Not an
+    /// OCPP key: it bounds the memory and the wait behind a failing CSMS.
+    pub sample_queue_limit: usize,
 }
 
 /// Runs the charge point until `shutdown` completes.
@@ -100,7 +113,10 @@ pub async fn run(
         meter: Meter::new(),
         transaction: None,
         sampler: None,
-        pending_stop: None,
+        queue: TxQueue::new(
+            settings.transaction_attempts,
+            settings.transaction_retry_interval,
+        ),
         inputs: Some(inputs),
         backoff: Backoff::new(settings.backoff),
         // `StdRng` is `Send`, unlike `rand::rng()`, so the future of `run`
@@ -183,11 +199,11 @@ struct Station<'a> {
     /// `None` without a transaction or with sampling off. Like the
     /// transaction, it survives a lost connection.
     sampler: Option<Interval>,
-    /// The StopTransaction of an ended transaction until the CSMS has
-    /// answered it. The transaction ends on the station at once; the
-    /// message is transaction-related and must reach the CSMS (section
-    /// 3.7), so it waits here across lost connections and failed CALLs.
-    pending_stop: Option<StopTransactionRequest>,
+    /// StopTransaction and MeterValues until the CSMS has answered them, or
+    /// they failed too often. They are transaction-related and must reach
+    /// the CSMS in order (section 3.7), so they wait here across lost
+    /// connections and failed CALLs.
+    queue: TxQueue<TxMessage>,
     /// Keyboard events; `None` once the sender is gone (stdin closed), so a
     /// closed channel is never polled again.
     inputs: Option<mpsc::Receiver<Input>>,
@@ -216,6 +232,16 @@ async fn next_sample(sampler: &mut Option<Interval>) {
         Some(sampler) => {
             sampler.tick().await;
         }
+        None => std::future::pending().await,
+    }
+}
+
+/// Waits until the head of `queue` may go; forever for an empty queue.
+/// `sleep_until` is cancel-safe: `select!` may drop it and build it again
+/// with the newest due time.
+async fn queue_due(queue: &TxQueue<TxMessage>) {
+    match queue.next_due(Instant::now()) {
+        Some(due) => sleep_until(due).await,
         None => std::future::pending().await,
     }
 }
@@ -312,12 +338,13 @@ impl Station<'_> {
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         ticker.tick().await; // first tick completes immediately — skip it
         // Events that waited for this moment are applied first, so the
-        // report below shows the final status. A transaction that ended
-        // meanwhile, or whose StopTransaction did not get through, is
-        // reported before the statuses: transaction-related messages go
-        // out in order and as soon as possible (section 3.7).
+        // report below shows the final status. Transaction-related messages
+        // that waited (a transaction that ended meanwhile, a message that
+        // did not get through) go before the statuses: in order and as soon
+        // as possible (section 3.7). The drain stops at the first failure,
+        // so a failing CSMS does not hold back the reports.
         self.apply_queued();
-        if let Err(ended) = self.send_pending_stop(client).await {
+        if let Err(ended) = self.drain(client).await {
             return ended;
         }
         if let Err(ended) = self.report_all(client).await {
@@ -328,7 +355,8 @@ impl Station<'_> {
             // An input that is already waiting when a sample is due (because
             // a CALL kept the loop busy) is applied first: a `stop` typed
             // before the sample must not be reported after it, or the sample
-            // would carry more energy than the following meterStop.
+            // would carry more energy than the following meterStop. The queue
+            // comes after both, so their messages join it in order.
             tokio::select! {
                 biased;
                 _ = ticker.tick() => {
@@ -336,13 +364,6 @@ impl Station<'_> {
                         Ok(_) => self.backoff.reset(),
                         Err(CallFailure::Disconnected) => return Ended::Lost,
                         Err(err) => warn!(%err, "Heartbeat failed"),
-                    }
-                    // A StopTransaction that failed on this connection is
-                    // tried again on every tick, whatever became of the
-                    // Heartbeat: a CSMS that fails Heartbeats must not stop
-                    // it for good. Attempt limits and waits: step 5c.
-                    if let Err(ended) = self.send_pending_stop(client).await {
-                        return ended;
                     }
                 }
                 // `select!` drops the other futures before it runs a handler,
@@ -354,6 +375,12 @@ impl Station<'_> {
                 }
                 () = next_sample(&mut self.sampler) => {
                     if let Err(ended) = self.send_sample(client).await {
+                        return ended;
+                    }
+                }
+                // A failed message whose wait is over goes again.
+                () = queue_due(&self.queue) => {
+                    if let Err(ended) = self.drain(client).await {
                         return ended;
                     }
                 }
@@ -395,12 +422,12 @@ impl Station<'_> {
         Ok(())
     }
 
-    /// Samples the meter of the open transaction now and sends it
-    /// (MeterValues). A failure that leaves the connection up is logged and
-    /// not retried: the next sample carries the newer reading. Samples that
-    /// fall while the station is offline are not taken; section 3.7 wants
-    /// them queued, which is step 5c. After a reconnect, a sample that was
-    /// due goes out once, not one per missed tick.
+    /// Samples the meter of the open transaction now and queues the sample
+    /// (MeterValues). At most `sample_queue_limit` samples wait; beyond that
+    /// the oldest waiting one is dropped, since the newer ones carry a newer
+    /// register. Samples that fall while the station is offline are not
+    /// taken (roadmap step 5c3). After a reconnect, a sample that was due
+    /// is taken once, not one per missed tick.
     async fn send_sample(&mut self, client: &Client) -> Result<(), Ended> {
         let Some(transaction) = &self.transaction else {
             return Ok(());
@@ -409,15 +436,20 @@ impl Station<'_> {
         let at = UtcDateTime::now();
         let register_wh = self.meter.reading(at);
         let request = transaction16::sample(CONNECTOR_ID, transaction, register_wh, at);
-        match client.call(&request).await {
-            Ok(_) => {
-                self.backoff.reset();
-                info!(transaction_id, register_wh, "meter sampled");
-            }
-            Err(CallFailure::Disconnected) => return Err(Ended::Lost),
-            Err(err) => warn!(transaction_id, %err, "MeterValues failed"),
+        info!(transaction_id, register_wh, "meter sampled");
+        let dropped = self.queue.push_limited(
+            TxMessage::Sample(request),
+            TxMessage::is_sample,
+            self.settings.sample_queue_limit,
+        );
+        for message in dropped {
+            warn!(
+                transaction_id = message.transaction_id(),
+                limit = self.settings.sample_queue_limit,
+                "too many MeterValues waiting, the oldest dropped"
+            );
         }
-        Ok(())
+        self.drain(client).await
     }
 
     /// A sampler for a transaction that starts now, or `None` if sampling
@@ -437,21 +469,52 @@ impl Station<'_> {
         Some(sampler)
     }
 
-    /// Sends the waiting StopTransaction, if any, and forgets it once the
-    /// CSMS has answered. A failure that leaves the connection up is
-    /// logged; the message stays and goes out again later.
-    async fn send_pending_stop(&mut self, client: &Client) -> Result<(), Ended> {
-        let Some(request) = &self.pending_stop else {
-            return Ok(());
-        };
-        let transaction_id = request.transaction_id;
-        match client.call(request).await {
-            Ok(_) => {
-                self.backoff.reset();
-                self.pending_stop = None;
+    /// Sends the queued messages that may go now, in order, until the queue
+    /// is empty, the head waits for a retry, or the connection is lost.
+    ///
+    /// A failure to process the message counts as a failed transmission:
+    /// CALLERROR (OCPP-J 1.6 errata 3.3), and also a timeout, or a CSMS
+    /// that never answers would hold the queue forever; an answer that does
+    /// not decode counts too. A lost connection does not count: the message
+    /// stays at the head and goes first on the next connection. After the
+    /// last attempt the message is discarded and the next one goes (section
+    /// 3.7.1).
+    async fn drain(&mut self, client: &Client) -> Result<(), Ended> {
+        while let Some(message) = self.queue.head_due(Instant::now()) {
+            let message = message.clone();
+            let sent = match &message {
+                TxMessage::Stop(request) => client.call(request).await.map(drop),
+                TxMessage::Sample(request) => client.call(request).await.map(drop),
+            };
+            let err = match sent {
+                Ok(()) => {
+                    self.backoff.reset();
+                    self.queue.delivered();
+                    continue;
+                }
+                Err(CallFailure::Disconnected) => return Err(Ended::Lost),
+                Err(err) => err,
+            };
+            match self.queue.failed(Instant::now()) {
+                Some(Failure::RetryAt(due)) => {
+                    warn!(
+                        action = message.action(),
+                        transaction_id = message.transaction_id(),
+                        %err,
+                        retry_in = ?due.saturating_duration_since(Instant::now()),
+                        "transaction message failed, will retry"
+                    );
+                    return Ok(());
+                }
+                Some(Failure::Discarded { transmissions, .. }) => warn!(
+                    action = message.action(),
+                    transaction_id = message.transaction_id(),
+                    attempts = transmissions,
+                    %err,
+                    "transaction message discarded"
+                ),
+                None => return Ok(()),
             }
-            Err(CallFailure::Disconnected) => return Err(Ended::Lost),
-            Err(err) => warn!(transaction_id, %err, "StopTransaction failed, will retry"),
         }
         Ok(())
     }
@@ -494,28 +557,24 @@ impl Station<'_> {
                 let Some(event) = event(&command) else {
                     return Ok(());
                 };
-                // At most one StopTransaction waits: a new transaction
-                // cannot start before it is delivered.
-                let had_stop = self.pending_stop.is_some();
                 let Some(report) = self.apply(event, input.at) else {
                     return Ok(());
                 };
-                // The transaction ended before the status changed: send
-                // StopTransaction first. Its failure is logged and the
-                // status still goes out, so the CSMS does not see a
-                // Charging connector until the next reconnect.
-                if !had_stop && self.pending_stop.is_some() {
-                    self.send_pending_stop(client).await?;
-                }
+                // If the transaction ended, its StopTransaction is queued:
+                // send it before the status. A failure is retried later and
+                // the status still goes out, so the CSMS does not see a
+                // Charging connector until then.
+                self.drain(client).await?;
                 self.send_report(client, &report).await
             }
         }
     }
 
     /// `start`: the user presents `text` as an idTag at `at`. Only in
-    /// Preparing (cable plugged in) and once the StopTransaction of the
-    /// previous transaction is delivered, so the CSMS gets the transactions
-    /// in order (section 3.7).
+    /// Preparing (cable plugged in) and once the queue is empty: section 3.7
+    /// lets a new transaction-related message go only after the queued
+    /// ones, and StartTransaction does not go through the queue yet (step
+    /// 5c2). With a CSMS that keeps failing, that wait can be long.
     /// Authorize, then StartTransaction; once the CSMS has answered it, the
     /// transaction exists and the connector starts charging. Anything that
     /// goes wrong before that answer leaves the connector in Preparing and
@@ -543,10 +602,11 @@ impl Station<'_> {
             );
             return Ok(());
         }
-        if let Some(stop) = &self.pending_stop {
+        if !self.queue.is_empty() {
             eprintln!(
-                "the end of transaction {} has not reached the CSMS yet, ignored",
-                stop.transaction_id
+                "{} transaction messages are still waiting for the CSMS (section 3.7); \
+                 start again once they are delivered",
+                self.queue.len()
             );
             return Ok(());
         }
@@ -634,7 +694,7 @@ impl Station<'_> {
             self.send_report(client, &report).await?;
         }
         if let Some(finishing) = stopped {
-            self.send_pending_stop(client).await?;
+            self.drain(client).await?;
             if let Some(report) = finishing {
                 self.send_report(client, &report).await?;
             }
@@ -643,8 +703,7 @@ impl Station<'_> {
     }
 
     /// Ends the open transaction at `at`, if there is one: the station
-    /// stops it at once and keeps its StopTransaction until the CSMS has
-    /// answered (`pending_stop`).
+    /// stops it at once and queues its StopTransaction.
     fn end_transaction(&mut self, cause: StopCause, at: UtcDateTime) {
         let Some(transaction) = self.transaction.take() else {
             return;
@@ -659,7 +718,7 @@ impl Station<'_> {
             reason = ?request.reason,
             "transaction stopped"
         );
-        self.pending_stop = Some(request);
+        self.queue.push(TxMessage::Stop(request));
     }
 
     /// Applies one event to the connector at `at`. On a state change the
@@ -787,6 +846,8 @@ mod tests {
     const MIN: Duration = Duration::from_millis(200);
     /// Room for a heartbeat (1 s, the smallest whole-second interval) plus scheduling.
     const HEARTBEAT_WAIT: Duration = Duration::from_secs(3);
+    /// `transaction_retry_interval` in tests.
+    const RETRY: Duration = Duration::from_millis(300);
 
     fn settings(call_timeout: Duration) -> Settings {
         Settings {
@@ -806,6 +867,9 @@ mod tests {
             // Off, so MeterValues do not get between the frames that the
             // other tests expect; the sampling tests turn it on.
             meter_sample_interval: Duration::ZERO,
+            transaction_attempts: 3,
+            transaction_retry_interval: RETRY,
+            sample_queue_limit: 30,
         }
     }
 
@@ -1852,9 +1916,9 @@ mod tests {
     }
 
     /// `stop`, with StopTransaction failing as `failure`: the status still
-    /// goes out at once, and the StopTransaction again after the next
-    /// Heartbeat, answered as `heartbeat` says.
-    async fn failed_stop_is_retried(failure: Failure, heartbeat_fails: bool) {
+    /// goes out at once, and the StopTransaction again once the retry
+    /// interval after the failure has passed, whatever the Heartbeats do.
+    async fn failed_stop_is_retried(failure: Failure) {
         let mut csms = FakeCsms::start().await;
         let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(SHORT));
         connect_and_accept(&mut csms).await;
@@ -1863,41 +1927,153 @@ mod tests {
         inputs.send(input(Command::Stop, T0 + 180)).await.unwrap();
         let expected = stop_payload(WH_120_S, 180, Some(TAG), None);
         let id = recv_stop(&mut csms, expected.clone()).await;
-        if let Failure::CallError = failure {
-            csms.send(call_error(&id));
-        } // else never answered: the call times out after SHORT
-        let finishing = report_at(1, "Finishing", "NoError", &wire_time(180));
-        expect_report(&mut csms, finishing).await;
+        // The earliest instant the failure can have been seen.
+        let failed = match failure {
+            Failure::CallError => {
+                csms.send(call_error(&id));
+                Instant::now()
+            }
+            // Never answered: the call times out after SHORT.
+            Failure::Timeout => Instant::now() + SHORT,
+        };
+        let (action, id, payload) = recv_skipping(&mut csms, &["Heartbeat"]).await;
+        assert_eq!(action, "StatusNotification");
+        assert_eq!(payload["status"], "Finishing");
+        csms.send(empty_result(&id));
 
-        let id = call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
-        csms.send(if heartbeat_fails {
-            call_error(&id)
-        } else {
-            heartbeat_result(&id)
-        });
-        let id = recv_stop(&mut csms, expected).await;
+        let (action, id, payload) = recv_skipping(&mut csms, &["Heartbeat"]).await;
+        assert_eq!(action, "StopTransaction");
+        assert_eq!(payload, expected);
+        let waited = failed.elapsed();
+        assert!(waited >= RETRY, "retried after {waited:?}");
         csms.send(empty_result(&id));
     }
 
     #[tokio::test]
-    async fn stop_transaction_call_error_is_retried_after_the_heartbeat() {
-        failed_stop_is_retried(Failure::CallError, false).await;
+    async fn stop_transaction_call_error_is_retried_after_the_retry_interval() {
+        failed_stop_is_retried(Failure::CallError).await;
     }
 
     #[tokio::test]
-    async fn stop_transaction_timeout_is_retried_after_the_heartbeat() {
-        failed_stop_is_retried(Failure::Timeout, false).await;
+    async fn stop_transaction_timeout_is_retried_after_the_retry_interval() {
+        failed_stop_is_retried(Failure::Timeout).await;
     }
 
     #[tokio::test]
-    async fn stop_transaction_is_retried_even_when_the_heartbeat_fails() {
-        failed_stop_is_retried(Failure::CallError, true).await;
-    }
-
-    #[tokio::test]
-    async fn start_is_refused_until_the_stop_is_delivered() {
+    async fn retries_wait_the_interval_times_the_transmissions() {
         let mut csms = FakeCsms::start().await;
         let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs).await;
+
+        inputs.send(input(Command::Stop, T0 + 180)).await.unwrap();
+        let expected = stop_payload(WH_120_S, 180, Some(TAG), None);
+        let id = recv_stop(&mut csms, expected.clone()).await;
+        csms.send(call_error(&id));
+        let mut failed = Instant::now();
+        let (_, id, _) = recv_skipping(&mut csms, &["Heartbeat"]).await; // Finishing
+        csms.send(empty_result(&id));
+
+        // Section 3.7.1: wait 1 · interval after the first failure, 2 ·
+        // interval after the second. The upper bounds catch a wrong factor.
+        for factor in [1, 2] {
+            let (action, id, payload) = recv_skipping(&mut csms, &["Heartbeat"]).await;
+            let waited = failed.elapsed();
+            assert_eq!(action, "StopTransaction");
+            assert_eq!(payload, expected);
+            let low = RETRY * factor;
+            let high = low + RETRY * 4 / 5;
+            assert!(
+                (low..high).contains(&waited),
+                "retry {factor} after {waited:?}"
+            );
+            if factor == 2 {
+                csms.send(empty_result(&id));
+            } else {
+                csms.send(call_error(&id));
+                failed = Instant::now();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_is_discarded_after_the_last_attempt() {
+        let logs = LogCapture::start(EnvFilter::new("cp_sim=warn"));
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs).await;
+
+        inputs.send(input(Command::Stop, T0 + 180)).await.unwrap();
+        // Three transmissions (`transaction_attempts`), each one failed.
+        for attempt in 1..=3 {
+            let (action, id, payload) =
+                recv_skipping(&mut csms, &["Heartbeat", "StatusNotification"]).await;
+            assert_eq!(action, "StopTransaction", "attempt {attempt}: {payload}");
+            csms.send(call_error(&id));
+        }
+
+        // The queue is empty again: a new transaction may start.
+        for command in [Command::Unplug, Command::Plug] {
+            inputs.send(input(command, T0 + 240)).await.unwrap();
+        }
+        inputs.send(present(TAG, T0 + 300)).await.unwrap();
+        let (action, _, _) = recv_skipping(&mut csms, &["Heartbeat", "StatusNotification"]).await;
+        assert_eq!(action, "Authorize");
+
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("transaction message discarded"));
+        let line = line.unwrap_or_else(|| panic!("no discard in the log:\n{text}"));
+        for field in [
+            "action=\"StopTransaction\"",
+            "transaction_id=7",
+            "attempts=3",
+        ] {
+            assert!(line.contains(field), "{field} missing in: {line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timeout_counts_as_an_attempt_until_discard() {
+        let mut csms = FakeCsms::start().await;
+        let call_timeout = Duration::from_millis(200);
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(call_timeout));
+        connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs).await;
+
+        inputs.send(input(Command::Stop, T0 + 180)).await.unwrap();
+        // Three silent transmissions: each one times out.
+        for attempt in 1..=3 {
+            let (action, _, payload) =
+                recv_skipping(&mut csms, &["Heartbeat", "StatusNotification"]).await;
+            assert_eq!(action, "StopTransaction", "attempt {attempt}: {payload}");
+        }
+
+        // Discarded after the third: a new transaction may start.
+        for command in [Command::Unplug, Command::Plug] {
+            inputs.send(input(command, T0 + 240)).await.unwrap();
+        }
+        inputs.send(present(TAG, T0 + 300)).await.unwrap();
+        let (action, _, payload) =
+            recv_skipping(&mut csms, &["Heartbeat", "StatusNotification"]).await;
+        assert_eq!(action, "Authorize", "{payload}");
+    }
+
+    /// Settings where a failed transaction message waits long, so the tests
+    /// see what happens while it waits.
+    fn slow_retry(call_timeout: Duration) -> Settings {
+        Settings {
+            transaction_retry_interval: LONG,
+            ..settings(call_timeout)
+        }
+    }
+
+    #[tokio::test]
+    async fn start_is_refused_while_transaction_messages_wait() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, slow_retry(LONG));
         connect_and_accept(&mut csms).await;
         start_charging(&mut csms, &inputs).await;
 
@@ -1921,6 +2097,24 @@ mod tests {
         inputs.send(input(Command::Unplug, T0 + 420)).await.unwrap();
         let available = report_at(1, "Available", "NoError", &wire_time(420));
         expect_report(&mut csms, available).await;
+    }
+
+    #[tokio::test]
+    async fn non_transaction_messages_do_not_wait_for_the_queue() {
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, slow_retry(LONG));
+        connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs).await;
+
+        inputs.send(input(Command::Stop, T0 + 180)).await.unwrap();
+        let id = recv_stop(&mut csms, stop_payload(WH_120_S, 180, Some(TAG), None)).await;
+        csms.send(call_error(&id));
+        // Section 3.7: StatusNotification and Heartbeat go while the
+        // StopTransaction waits for its retry.
+        let finishing = report_at(1, "Finishing", "NoError", &wire_time(180));
+        expect_report(&mut csms, finishing).await;
+        let id = call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
+        csms.send(heartbeat_result(&id));
     }
 
     #[tokio::test]
@@ -2282,38 +2476,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn meter_values_call_error_keeps_connection_and_sampling() {
+    async fn a_failed_sample_is_retried_after_the_retry_interval() {
         let mut csms = FakeCsms::start().await;
         let (inputs, _cp) = spawn_run_inputs(&csms.url, sampling(LONG));
         connect_and_accept(&mut csms).await;
         start_charging_from(&mut csms, &inputs, now_unix() - 120).await;
 
-        let (id, _) = recv_sample(&mut csms).await;
+        let (id, first) = recv_sample(&mut csms).await;
         csms.send(call_error(&id));
-        // The next sample, on the same connection (`recv_sample` panics on
-        // anything but a CALL).
+        // The same sample again, on the same connection, before the newer
+        // ones that queued behind it.
+        let (id, payload) = recv_sample(&mut csms).await;
+        assert_eq!(payload, first);
+        csms.send(empty_result(&id));
         let (id, payload) = recv_sample(&mut csms).await;
         sample_value(&payload);
         csms.send(empty_result(&id));
     }
 
     #[tokio::test]
-    async fn connection_lost_during_meter_values_keeps_sampling() {
+    async fn a_sample_lost_with_the_connection_goes_first_after_the_reconnect() {
         let mut csms = FakeCsms::start().await;
         let (inputs, _cp) = spawn_run_inputs(&csms.url, sampling(LONG));
         connect_and_accept(&mut csms).await;
         let base = now_unix() - 120;
         start_charging_from(&mut csms, &inputs, base).await;
 
-        recv_sample(&mut csms).await; // never answered
+        let (_, lost) = recv_sample(&mut csms).await; // never answered
         csms.close_connection();
         reconnect_gap(&mut csms).await;
 
-        // The reports first, then the samples of the same transaction.
+        // The sample first (section 3.7), then the reports, then new
+        // samples of the same transaction.
+        let (action, id, payload) = recv_skipping(&mut csms, &[]).await;
+        assert_eq!(action, "MeterValues");
+        assert_eq!(payload, lost);
+        csms.send(empty_result(&id));
         expect_report(&mut csms, report_payload(0)).await;
         let charging = report_at(1, "Charging", "NoError", &wire(base + 60));
         expect_report(&mut csms, charging).await;
         let (id, payload) = recv_sample(&mut csms).await;
+        sample_value(&payload);
+        csms.send(empty_result(&id));
+    }
+
+    #[tokio::test]
+    async fn the_oldest_sample_is_dropped_when_the_queue_is_full() {
+        let mut csms = FakeCsms::start().await;
+        // A failed sample waits LONG; two samples may wait at most.
+        let settings = Settings {
+            sample_queue_limit: 2,
+            transaction_retry_interval: LONG,
+            ..sampling(LONG)
+        };
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings);
+        connect_and_accept(&mut csms).await;
+        start_charging_from(&mut csms, &inputs, now_unix() - 120).await;
+
+        let (id, _) = recv_sample(&mut csms).await;
+        csms.send(call_error(&id));
+        let failed = Instant::now();
+        // The third sample drops the failed one at the head, and the second
+        // goes at once instead of waiting LONG behind it.
+        let (id, payload) = recv_sample(&mut csms).await;
+        let after = failed.elapsed();
+        assert!(
+            after < LONG / 2,
+            "waited behind the failed sample: {after:?}"
+        );
         sample_value(&payload);
         csms.send(empty_result(&id));
     }
