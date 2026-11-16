@@ -70,7 +70,12 @@ pub struct Settings {
     pub transaction_retry_interval: Duration,
     /// MeterValues that may wait in the queue at most; when a new sample
     /// comes, the oldest waiting one is dropped (0 counts as 1). Not an
-    /// OCPP key: it bounds the memory and the wait behind a failing CSMS.
+    /// OCPP key. It is the memory a station spends to keep what it would
+    /// have sent while offline (section 3.7 has no limit, so dropping is a
+    /// deviation), so it must cover the outages worth surviving. It also
+    /// bounds how long a StopTransaction waits behind the samples of a CSMS
+    /// that keeps failing them, and how long the status reports wait after
+    /// a long outage: the whole queue goes out before them.
     pub sample_queue_limit: usize,
 }
 
