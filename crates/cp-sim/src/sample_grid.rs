@@ -21,18 +21,10 @@ use std::time::Duration;
 
 use time::UtcDateTime;
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by session in the next commit")
-)]
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
 
 /// The sample points of one transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by session in the next commit")
-)]
 pub struct SampleGrid {
     start: UtcDateTime,
     /// Never zero.
@@ -43,10 +35,6 @@ pub struct SampleGrid {
 
 /// Points handed out by one call.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used by session in the next commit")
-)]
 pub struct Taken {
     /// Due points that were not computed because more than `keep_last` were
     /// due. They were the oldest ones.
@@ -59,10 +47,6 @@ impl SampleGrid {
     /// A grid for a transaction that starts at `start`. `None` if sampling is
     /// off (a zero period) or if not even the first point exists (the date
     /// after `start + period` is out of range).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by session in the next commit")
-    )]
     pub fn new(start: UtcDateTime, period: Duration) -> Option<Self> {
         if period.is_zero() {
             return None;
@@ -78,10 +62,6 @@ impl SampleGrid {
 
     /// The next point that has not been handed out; `None` once the dates
     /// run out.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by session in the next commit")
-    )]
     pub fn next_point(&self) -> Option<UtcDateTime> {
         self.point(self.taken.checked_add(1)?)
     }
@@ -102,18 +82,10 @@ impl SampleGrid {
     }
 
     /// Like `take_before`, but a point exactly at `until` is due as well.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by session in the next commit")
-    )]
     pub fn take_up_to(&mut self, until: UtcDateTime, keep_last: usize) -> Taken {
         self.take(until, true, keep_last)
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by session in the next commit")
-    )]
     fn take(&mut self, until: UtcDateTime, inclusive: bool, keep_last: usize) -> Taken {
         let keep_last = u64::try_from(keep_last).unwrap_or(u64::MAX).max(1);
         let due = self.last_due(until, inclusive);
@@ -135,10 +107,6 @@ impl SampleGrid {
 
     /// The number of the last point before `until` (or at it, if
     /// `inclusive`); 0 if there is none.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by session in the next commit")
-    )]
     fn last_due(&self, until: UtcDateTime, inclusive: bool) -> u64 {
         let elapsed = (until - self.start).whole_nanoseconds();
         let Ok(elapsed) = u128::try_from(elapsed) else {
@@ -159,10 +127,6 @@ impl SampleGrid {
     /// Point number `k`: `start + k·period`, computed by multiplication in
     /// nanoseconds, so nothing adds up over thousands of points and `k` may
     /// pass 2^32. `None` if the date is out of range.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by session in the next commit")
-    )]
     fn point(&self, k: u64) -> Option<UtcDateTime> {
         let nanos = self.period.as_nanos().checked_mul(u128::from(k))?;
         let seconds = i64::try_from(nanos / NANOS_PER_SECOND).ok()?;
