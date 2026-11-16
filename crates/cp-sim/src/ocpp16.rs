@@ -198,8 +198,11 @@ impl Request for StartTransactionRequest {
 
 // --- StopTransaction ---
 
-/// `transactionData` (meter values of the transaction) is left out until
-/// MeterValues exist (roadmap step 5b). `idTag` is the identifier that
+/// `transactionData` (meter values of the transaction) is left out: the
+/// station behaves as if `StopTxnSampledData` and `StopTxnAlignedData` were
+/// empty, and then it SHALL NOT put meter values here (section 3.16.5;
+/// errata 3.14 recommends Transaction.Begin and .End values only when they
+/// are configured). `idTag` is the identifier that
 /// stopped the transaction; it may be absent when the station stops it by
 /// itself (section 4.10). `reason` absent means `Local`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -248,6 +251,236 @@ pub enum StopReason {
 impl Request for StopTransactionRequest {
     const ACTION: &'static str = "StopTransaction";
     type Response = StopTransactionResponse;
+}
+
+// --- MeterValues (section 4.7; SampledValue and its enums, section 7) ---
+
+/// Meter values of `connector_id`. `transaction_id` is the transaction going
+/// on at that connector when the sample was taken (errata 3.16).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeterValuesRequest {
+    pub connector_id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction_id: Option<i32>,
+    pub meter_value: Vec<MeterValue>,
+}
+
+/// Values sampled at the same instant.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeterValue {
+    #[serde(serialize_with = "timestamp::serialize")]
+    pub timestamp: UtcDateTime,
+    pub sampled_value: Vec<SampledValue>,
+}
+
+/// One value. Every field but `value` is optional; their defaults (section
+/// 4.7) make a bare value a register reading of active import energy in
+/// Wh, sampled periodically. `format`, `phase` and `location` are part of
+/// the schema but not filled by the station yet: it has one meter, on the
+/// outlet, without phases.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SampledValue {
+    /// A decimal number, or signed data, as a string (section 7.43).
+    pub value: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<ReadingContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<ValueFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measurand: Option<Measurand>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<Phase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<Location>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<UnitOfMeasure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MeterValuesResponse {}
+
+impl Request for MeterValuesRequest {
+    const ACTION: &'static str = "MeterValues";
+    type Response = MeterValuesResponse;
+}
+
+/// Why a value was taken; every value of the schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "values of the schema the station does not send yet"
+    )
+)]
+pub enum ReadingContext {
+    #[serde(rename = "Interruption.Begin")]
+    InterruptionBegin,
+    #[serde(rename = "Interruption.End")]
+    InterruptionEnd,
+    #[serde(rename = "Sample.Clock")]
+    SampleClock,
+    #[serde(rename = "Sample.Periodic")]
+    SamplePeriodic,
+    #[serde(rename = "Transaction.Begin")]
+    TransactionBegin,
+    #[serde(rename = "Transaction.End")]
+    TransactionEnd,
+    Trigger,
+    Other,
+}
+
+/// Raw number or signed data; every value of the schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "values of the schema the station does not send yet"
+    )
+)]
+pub enum ValueFormat {
+    Raw,
+    SignedData,
+}
+
+/// What a value measures; every value of the schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "values of the schema the station does not send yet"
+    )
+)]
+pub enum Measurand {
+    #[serde(rename = "Energy.Active.Export.Register")]
+    EnergyActiveExportRegister,
+    #[serde(rename = "Energy.Active.Import.Register")]
+    EnergyActiveImportRegister,
+    #[serde(rename = "Energy.Reactive.Export.Register")]
+    EnergyReactiveExportRegister,
+    #[serde(rename = "Energy.Reactive.Import.Register")]
+    EnergyReactiveImportRegister,
+    #[serde(rename = "Energy.Active.Export.Interval")]
+    EnergyActiveExportInterval,
+    #[serde(rename = "Energy.Active.Import.Interval")]
+    EnergyActiveImportInterval,
+    #[serde(rename = "Energy.Reactive.Export.Interval")]
+    EnergyReactiveExportInterval,
+    #[serde(rename = "Energy.Reactive.Import.Interval")]
+    EnergyReactiveImportInterval,
+    #[serde(rename = "Power.Active.Export")]
+    PowerActiveExport,
+    #[serde(rename = "Power.Active.Import")]
+    PowerActiveImport,
+    #[serde(rename = "Power.Offered")]
+    PowerOffered,
+    #[serde(rename = "Power.Reactive.Export")]
+    PowerReactiveExport,
+    #[serde(rename = "Power.Reactive.Import")]
+    PowerReactiveImport,
+    #[serde(rename = "Power.Factor")]
+    PowerFactor,
+    #[serde(rename = "Current.Import")]
+    CurrentImport,
+    #[serde(rename = "Current.Export")]
+    CurrentExport,
+    #[serde(rename = "Current.Offered")]
+    CurrentOffered,
+    Voltage,
+    Frequency,
+    Temperature,
+    SoC,
+    #[serde(rename = "RPM")]
+    Rpm,
+}
+
+/// The phase a value belongs to; every value of the schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "values of the schema the station does not send yet"
+    )
+)]
+pub enum Phase {
+    L1,
+    L2,
+    L3,
+    N,
+    #[serde(rename = "L1-N")]
+    L1N,
+    #[serde(rename = "L2-N")]
+    L2N,
+    #[serde(rename = "L3-N")]
+    L3N,
+    #[serde(rename = "L1-L2")]
+    L1L2,
+    #[serde(rename = "L2-L3")]
+    L2L3,
+    #[serde(rename = "L3-L1")]
+    L3L1,
+}
+
+/// Where a value is measured; every value of the schema.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "values of the schema the station does not send yet"
+    )
+)]
+pub enum Location {
+    Cable,
+    EV,
+    Inlet,
+    Outlet,
+    Body,
+}
+
+/// The unit of a value; every value of the schema. Both spellings of
+/// Celsius are there: the 1.6 schemas had only the misspelt `Celcius`, and
+/// OCPP-J 1.6 errata 2.1 (2025-04) adds `Celsius` but advises a charge
+/// point to keep sending `Celcius` for interoperability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "values of the schema the station does not send yet"
+    )
+)]
+pub enum UnitOfMeasure {
+    Wh,
+    #[serde(rename = "kWh")]
+    KWh,
+    #[serde(rename = "varh")]
+    Varh,
+    #[serde(rename = "kvarh")]
+    Kvarh,
+    W,
+    #[serde(rename = "kW")]
+    KW,
+    VA,
+    #[serde(rename = "kVA")]
+    Kva,
+    #[serde(rename = "var")]
+    Var,
+    #[serde(rename = "kvar")]
+    Kvar,
+    A,
+    V,
+    K,
+    Celcius,
+    Celsius,
+    Fahrenheit,
+    Percent,
 }
 
 #[cfg(test)]
@@ -572,5 +805,224 @@ mod tests {
         for (reason, text) in schema {
             assert_eq!(serde_json::to_value(reason).unwrap(), json!(text));
         }
+    }
+
+    // --- MeterValues ---
+
+    #[test]
+    fn meter_values_request_omits_absent_optionals() {
+        let req = MeterValuesRequest {
+            connector_id: 1,
+            transaction_id: None,
+            meter_value: vec![MeterValue {
+                timestamp: NOON,
+                sampled_value: vec![SampledValue {
+                    value: "246".into(),
+                    context: None,
+                    format: None,
+                    measurand: None,
+                    phase: None,
+                    location: None,
+                    unit: None,
+                }],
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(req).unwrap(),
+            json!({
+                "connectorId": 1,
+                "meterValue": [{
+                    "timestamp": "1970-01-01T00:00:00Z",
+                    "sampledValue": [{"value": "246"}],
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn sampled_value_includes_present_optionals() {
+        let value = SampledValue {
+            value: "230.5".into(),
+            context: Some(ReadingContext::SamplePeriodic),
+            format: Some(ValueFormat::Raw),
+            measurand: Some(Measurand::Voltage),
+            phase: Some(Phase::L1N),
+            location: Some(Location::Outlet),
+            unit: Some(UnitOfMeasure::V),
+        };
+        assert_eq!(
+            serde_json::to_value(value).unwrap(),
+            json!({
+                "value": "230.5",
+                "context": "Sample.Periodic",
+                "format": "Raw",
+                "measurand": "Voltage",
+                "phase": "L1-N",
+                "location": "Outlet",
+                "unit": "V",
+            })
+        );
+    }
+
+    #[test]
+    fn meter_values_response_parses_empty_object() {
+        let resp = serde_json::from_str::<MeterValuesResponse>("{}").unwrap();
+        assert_eq!(resp, MeterValuesResponse {});
+    }
+
+    /// Asserts that `values` serialize to `texts`, in order: the enum of the
+    /// schema, in schema order.
+    fn assert_schema_strings<T: Serialize>(values: &[T], texts: &[&str]) {
+        assert_eq!(values.len(), texts.len(), "not every value of the schema");
+        for (value, text) in values.iter().zip(texts) {
+            assert_eq!(serde_json::to_value(value).unwrap(), json!(text));
+        }
+    }
+
+    #[test]
+    fn sampled_value_enums_match_the_schema_strings() {
+        assert_schema_strings(
+            &[
+                ReadingContext::InterruptionBegin,
+                ReadingContext::InterruptionEnd,
+                ReadingContext::SampleClock,
+                ReadingContext::SamplePeriodic,
+                ReadingContext::TransactionBegin,
+                ReadingContext::TransactionEnd,
+                ReadingContext::Trigger,
+                ReadingContext::Other,
+            ],
+            &[
+                "Interruption.Begin",
+                "Interruption.End",
+                "Sample.Clock",
+                "Sample.Periodic",
+                "Transaction.Begin",
+                "Transaction.End",
+                "Trigger",
+                "Other",
+            ],
+        );
+        assert_schema_strings(
+            &[ValueFormat::Raw, ValueFormat::SignedData],
+            &["Raw", "SignedData"],
+        );
+        assert_schema_strings(
+            &[
+                Measurand::EnergyActiveExportRegister,
+                Measurand::EnergyActiveImportRegister,
+                Measurand::EnergyReactiveExportRegister,
+                Measurand::EnergyReactiveImportRegister,
+                Measurand::EnergyActiveExportInterval,
+                Measurand::EnergyActiveImportInterval,
+                Measurand::EnergyReactiveExportInterval,
+                Measurand::EnergyReactiveImportInterval,
+                Measurand::PowerActiveExport,
+                Measurand::PowerActiveImport,
+                Measurand::PowerOffered,
+                Measurand::PowerReactiveExport,
+                Measurand::PowerReactiveImport,
+                Measurand::PowerFactor,
+                Measurand::CurrentImport,
+                Measurand::CurrentExport,
+                Measurand::CurrentOffered,
+                Measurand::Voltage,
+                Measurand::Frequency,
+                Measurand::Temperature,
+                Measurand::SoC,
+                Measurand::Rpm,
+            ],
+            &[
+                "Energy.Active.Export.Register",
+                "Energy.Active.Import.Register",
+                "Energy.Reactive.Export.Register",
+                "Energy.Reactive.Import.Register",
+                "Energy.Active.Export.Interval",
+                "Energy.Active.Import.Interval",
+                "Energy.Reactive.Export.Interval",
+                "Energy.Reactive.Import.Interval",
+                "Power.Active.Export",
+                "Power.Active.Import",
+                "Power.Offered",
+                "Power.Reactive.Export",
+                "Power.Reactive.Import",
+                "Power.Factor",
+                "Current.Import",
+                "Current.Export",
+                "Current.Offered",
+                "Voltage",
+                "Frequency",
+                "Temperature",
+                "SoC",
+                "RPM",
+            ],
+        );
+        assert_schema_strings(
+            &[
+                Phase::L1,
+                Phase::L2,
+                Phase::L3,
+                Phase::N,
+                Phase::L1N,
+                Phase::L2N,
+                Phase::L3N,
+                Phase::L1L2,
+                Phase::L2L3,
+                Phase::L3L1,
+            ],
+            &[
+                "L1", "L2", "L3", "N", "L1-N", "L2-N", "L3-N", "L1-L2", "L2-L3", "L3-L1",
+            ],
+        );
+        assert_schema_strings(
+            &[
+                Location::Cable,
+                Location::EV,
+                Location::Inlet,
+                Location::Outlet,
+                Location::Body,
+            ],
+            &["Cable", "EV", "Inlet", "Outlet", "Body"],
+        );
+        assert_schema_strings(
+            &[
+                UnitOfMeasure::Wh,
+                UnitOfMeasure::KWh,
+                UnitOfMeasure::Varh,
+                UnitOfMeasure::Kvarh,
+                UnitOfMeasure::W,
+                UnitOfMeasure::KW,
+                UnitOfMeasure::VA,
+                UnitOfMeasure::Kva,
+                UnitOfMeasure::Var,
+                UnitOfMeasure::Kvar,
+                UnitOfMeasure::A,
+                UnitOfMeasure::V,
+                UnitOfMeasure::K,
+                UnitOfMeasure::Celcius,
+                UnitOfMeasure::Celsius,
+                UnitOfMeasure::Fahrenheit,
+                UnitOfMeasure::Percent,
+            ],
+            &[
+                "Wh",
+                "kWh",
+                "varh",
+                "kvarh",
+                "W",
+                "kW",
+                "VA",
+                "kVA",
+                "var",
+                "kvar",
+                "A",
+                "V",
+                "K",
+                "Celcius",
+                "Celsius",
+                "Fahrenheit",
+                "Percent",
+            ],
+        );
     }
 }
