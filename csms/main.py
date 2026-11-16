@@ -64,6 +64,24 @@ def fail_counts(name: str) -> dict[str, int]:
 #                                                (InternalError)
 FAIL_FIRST = fail_counts("FAIL_FIRST")
 
+# A lost answer on demand, for testing a repeated StartTransaction:
+#   DELAY_FIRST=StartTransaction=35   the first StartTransaction of this run
+#                                     is processed, but its answer goes out
+#                                     35 s late, after the client's call
+#                                     timeout (30 s), so the client sends it
+#                                     again
+DELAY_FIRST = fail_counts("DELAY_FIRST")
+
+
+async def delay_first(action: str) -> None:
+    """Sleeps once, for the first request of `action`, as DELAY_FIRST asks.
+    `asyncio.sleep`, not `time.sleep`: the other connections and the
+    WebSocket pings go on meanwhile."""
+    seconds = DELAY_FIRST.pop(action, 0)
+    if seconds > 0:
+        logger.warning(f"{action}: answering {seconds} s late on demand")
+        await asyncio.sleep(seconds)
+
 
 def fail_first(action: str) -> None:
     """Raises, so the `ocpp` library answers with CALLERROR, while the
@@ -77,8 +95,29 @@ def fail_first(action: str) -> None:
 
 # Transaction IDs are unique per CSMS run, starting at 1.
 next_transaction_id = 1
-# Open transactions: ID -> (charge point ID, idTag, meterStart).
-open_transactions: dict[int, tuple[str, str, int]] = {}
+# Open transactions: ID -> (charge point ID, connector, idTag, meterStart,
+# timestamp of the start).
+open_transactions: dict[int, tuple[str, int, str, int, str]] = {}
+
+# The ID a charge point sends for a transaction whose StartTransaction it
+# never got an answer to (errata 3.18).
+UNKNOWN_TRANSACTION = -1
+
+
+def unknown_transaction(charge_point: str, action: str, transaction_id: int) -> None:
+    """Warns about a transaction this CSMS does not have open."""
+    if transaction_id == UNKNOWN_TRANSACTION:
+        logger.warning(
+            f"{action} from {charge_point} for a transaction unknown to the charge "
+            f"point (transactionId -1, errata 3.18)"
+        )
+    else:
+        logger.warning(
+            f"{action} from {charge_point} for unknown or closed "
+            f"transaction_id={transaction_id}"
+        )
+
+
 # The last energy register reported per open transaction, in Wh.
 last_register: dict[int, float] = {}
 
@@ -160,26 +199,52 @@ class ChargePoint(cp):
         return call_result.Authorize(id_tag_info=IdTagInfo(status=status))
 
     @on(Action.start_transaction)
-    def on_start_transaction(
+    async def on_start_transaction(
         self, connector_id, id_tag, meter_start, timestamp, **kwargs
     ):
         global next_transaction_id
-        transaction_id = next_transaction_id
-        next_transaction_id += 1
+        fail_first("StartTransaction")
         tag = id_tag.casefold()
         status = (
             AuthorizationStatus.blocked
             if tag in BLOCKED_ID_TAGS or tag in START_REJECTED_ID_TAGS
             else AuthorizationStatus.accepted
         )
+        # A charge point sends StartTransaction again when the answer was
+        # lost (section 3.7.1). The same start gets the same ID, so no
+        # second transaction stays open.
+        for known_id, known in open_transactions.items():
+            cp_id, connector, known_tag, _, started = known
+            if (cp_id, connector, known_tag, started) == (
+                self.id,
+                connector_id,
+                id_tag,
+                timestamp,
+            ):
+                logger.warning(
+                    f"repeated StartTransaction from {self.id}: same start as "
+                    f"transaction_id={known_id}, answering with it"
+                )
+                return call_result.StartTransaction(
+                    transaction_id=known_id, id_tag_info=IdTagInfo(status=status)
+                )
+        transaction_id = next_transaction_id
+        next_transaction_id += 1
         # Section 4.8: the CSMS answers with a transaction ID even when it
         # does not accept the idTag; the charge point then stops it.
-        open_transactions[transaction_id] = (self.id, id_tag, meter_start)
+        open_transactions[transaction_id] = (
+            self.id,
+            connector_id,
+            id_tag,
+            meter_start,
+            timestamp,
+        )
         logger.info(
             f"StartTransaction from {self.id}: connector={connector_id} id_tag={id_tag} "
             f"meter_start={meter_start} timestamp={timestamp} "
             f"-> transaction_id={transaction_id} {status}"
         )
+        await delay_first("StartTransaction")
         return call_result.StartTransaction(
             transaction_id=transaction_id, id_tag_info=IdTagInfo(status=status)
         )
@@ -189,9 +254,7 @@ class ChargePoint(cp):
         fail_first("MeterValues")
         transaction_id = kwargs.get("transaction_id")
         if transaction_id is not None and transaction_id not in open_transactions:
-            logger.warning(
-                f"MeterValues from {self.id} for unknown or closed transaction_id={transaction_id}"
-            )
+            unknown_transaction(self.id, "MeterValues", transaction_id)
         for sample in meter_value:
             for sampled_value in sample["sampled_value"]:
                 logger.info(
@@ -230,12 +293,10 @@ class ChargePoint(cp):
             # A repeated or unknown StopTransaction still gets an ordinary
             # answer: an error would make the charge point send it again
             # and again (section 3.7.1).
-            logger.warning(
-                f"StopTransaction from {self.id} for unknown or closed "
-                f"transaction_id={transaction_id}: meter_stop={meter_stop} reason={reason}"
-            )
+            unknown_transaction(self.id, "StopTransaction", transaction_id)
+            logger.info(f"meter_stop={meter_stop} reason={reason}")
         else:
-            _, _, meter_start = started
+            _, _, _, meter_start, _ = started
             logger.info(
                 f"StopTransaction from {self.id}: transaction_id={transaction_id} "
                 f"id_tag={id_tag} meter_stop={meter_stop} "

@@ -76,7 +76,7 @@ instead.
          after the last attempt; at most 30 samples wait. Replaces
          `pending_stop`. `start` waits for an empty queue.
          [#19](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/19)
-   - [ ] **5c2.** StartTransaction through the queue: the transaction
+   - [x] **5c2.** StartTransaction through the queue: the transaction
          starts on the station right after Authorize Accepted, and its
          messages carry `transactionId` -1 if StartTransaction was never
          answered (errata 3.18). This changes the 5a model, where a
@@ -89,7 +89,10 @@ instead.
          the order of status reports around a late DeAuthorized; one place
          for the transaction ID. Removes the 5c1 wait of `start` for an
          empty queue, which can last up to about an hour behind a failing
-         CSMS.
+         CSMS. Done: a deauthorization stops the transaction at the time of
+         the answer, a fault then clears to Finishing, and the test CSMS
+         answers a repeated start with the same ID.
+         [#20](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/20)
    - [ ] **5c3.** MeterValues for the sample ticks that fall while the
          station is offline (section 3.7), computed when the waiting inputs
          are applied after the reconnect, at the points of the sample grid
@@ -175,8 +178,10 @@ Found during the migration inventory; carried over as is
       StopTransaction (reason `Local` or `Reboot`); today the CSMS keeps
       it open (step 5a).
 - [ ] The queue of transaction-related messages is lost on shutdown, so a
-      transaction that already ended may never reach the CSMS: send it
-      before Close, or keep it on disk (steps 5a, 5c1).
+      transaction that already ended may never reach the CSMS, and since
+      step 5c2 not even its StartTransaction, although energy was
+      delivered: send the queue before Close, or keep it on disk (steps 5a,
+      5c1, 5c2).
 - [ ] A message on which the CSMS drops the connection blocks the queue:
       a lost connection does not count as a failed attempt (step 5c1).
 - [ ] Retry a transaction message with the same message ID (OCPP-J 1.6

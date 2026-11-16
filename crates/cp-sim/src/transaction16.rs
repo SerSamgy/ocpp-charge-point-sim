@@ -19,7 +19,7 @@
 //!   `Energy.Active.Import.Register` (section 9.1.17): a sample carries the
 //!   meter register and nothing else.
 
-use std::{fmt, num::NonZeroU32};
+use std::{collections::HashMap, fmt, num::NonZeroU32};
 
 use time::UtcDateTime;
 
@@ -80,15 +80,55 @@ impl fmt::Display for IdTag {
     }
 }
 
-/// A transaction the CSMS knows about: it answered StartTransaction.
+/// A transaction of the station. `local` is the station's own number for
+/// it, counted from 1 in each run; the ID the CSMS gives it lives in
+/// `TxIds`, the one place for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transaction {
-    /// Chosen by the CSMS in StartTransaction.conf.
-    pub id: i32,
+    pub local: u32,
     /// The idTag that started it.
     pub id_tag: IdTag,
     /// The meter register at the start, in Wh.
     pub meter_start: u64,
+}
+
+/// The transaction IDs the CSMS gave, by local number.
+#[derive(Debug, Default)]
+pub struct TxIds {
+    ids: HashMap<u32, i32>,
+}
+
+impl TxIds {
+    /// The CSMS answered the StartTransaction of `local`: keep its ID and
+    /// say what the answer means (errata 3.17).
+    pub fn on_delivered(
+        &mut self,
+        local: u32,
+        response: &StartTransactionResponse,
+    ) -> StartDecision {
+        self.ids.insert(local, response.transaction_id);
+        match response.id_tag_info.status {
+            AuthorizationStatus::Accepted => StartDecision::Charge,
+            _ => StartDecision::StopDeAuthorized,
+        }
+    }
+
+    /// The ID of `local`, if the CSMS has given one.
+    pub fn get(&self, local: u32) -> Option<i32> {
+        self.ids.get(&local).copied()
+    }
+
+    /// The ID to send for `local`: -1 if the CSMS never gave one, because
+    /// its StartTransaction was not delivered (errata 3.18).
+    pub fn resolve(&self, local: u32) -> i32 {
+        self.get(local).unwrap_or(-1)
+    }
+
+    /// The last message of `local` (its StopTransaction) is done: the ID
+    /// is not needed any more.
+    pub fn forget(&mut self, local: u32) {
+        self.ids.remove(&local);
+    }
 }
 
 /// Why a transaction ends, in our words; `stop` turns it into the 1.6
@@ -146,15 +186,19 @@ pub enum StartDecision {
     StopDeAuthorized,
 }
 
-pub fn on_start_conf(response: &StartTransactionResponse) -> StartDecision {
-    match response.id_tag_info.status {
-        AuthorizationStatus::Accepted => StartDecision::Charge,
-        _ => StartDecision::StopDeAuthorized,
-    }
+/// What a StopTransaction carries, without the transaction ID: the ID is
+/// filled in when the message is sent (`TxMessage::outgoing`), because the
+/// CSMS may not have given it yet.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StopData {
+    id_tag: Option<String>,
+    pub meter_stop: u64,
+    timestamp: UtcDateTime,
+    pub reason: Option<StopReason>,
 }
 
-/// StopTransaction for `transaction`, ended at `at` with the meter at
-/// `meter_stop` Wh.
+/// The stop of `transaction`, ended at `at` with the meter at `meter_stop`
+/// Wh.
 ///
 /// `idTag` is the identifier that stopped the transaction. Only a stop by
 /// the user carries it (the same idTag that started it: the keyboard has
@@ -166,16 +210,15 @@ pub fn stop(
     cause: StopCause,
     meter_stop: u64,
     at: UtcDateTime,
-) -> StopTransactionRequest {
+) -> StopData {
     let id_tag = match cause {
         StopCause::Local => Some(transaction.id_tag.0.clone()),
         StopCause::EvDisconnected | StopCause::DeAuthorized => None,
     };
-    StopTransactionRequest {
+    StopData {
         id_tag,
         meter_stop,
         timestamp: at,
-        transaction_id: transaction.id,
         reason: reason(cause),
     }
 }
@@ -190,41 +233,47 @@ fn reason(cause: StopCause) -> Option<StopReason> {
     }
 }
 
-/// MeterValues for `transaction` on `connector`: the meter register,
-/// `reading_wh`, sampled at `at` (section 3.16.1, sampled meter data).
-///
-/// Measurand, unit and context are written out although they are the
-/// defaults of section 4.7, so a CSMS need not know the defaults to read
-/// the value.
-pub fn sample(
+/// What a periodic sample carries, without the transaction ID (see
+/// `StopData`): the meter register, `register_wh`, on `connector` at `at`
+/// (section 3.16.1, sampled meter data).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SampleData {
     connector: NonZeroU32,
-    transaction: &Transaction,
-    reading_wh: u64,
+    pub register_wh: u64,
     at: UtcDateTime,
-) -> MeterValuesRequest {
-    MeterValuesRequest {
-        connector_id: connector.get(),
-        transaction_id: Some(transaction.id),
-        meter_value: vec![MeterValue {
-            timestamp: at,
-            sampled_value: vec![SampledValue {
-                value: reading_wh.to_string(),
-                context: Some(ReadingContext::SamplePeriodic),
-                format: None,
-                measurand: Some(Measurand::EnergyActiveImportRegister),
-                phase: None,
-                location: None,
-                unit: Some(UnitOfMeasure::Wh),
-            }],
-        }],
+}
+
+pub fn sample(connector: NonZeroU32, register_wh: u64, at: UtcDateTime) -> SampleData {
+    SampleData {
+        connector,
+        register_wh,
+        at,
     }
 }
 
 /// A transaction-related message (section 3.7) waiting in the queue of the
-/// station. StartTransaction is not queued yet: it goes out directly, and
-/// the transaction exists only once it is answered (roadmap step 5c2).
+/// station, for the transaction `local`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TxMessage {
+    /// StartTransaction carries no transaction ID, so it is kept ready.
+    Start {
+        local: u32,
+        request: StartTransactionRequest,
+    },
+    Stop {
+        local: u32,
+        data: StopData,
+    },
+    Sample {
+        local: u32,
+        data: SampleData,
+    },
+}
+
+/// A queued message as it goes on the wire.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outgoing {
+    Start(StartTransactionRequest),
     Stop(StopTransactionRequest),
     Sample(MeterValuesRequest),
 }
@@ -233,16 +282,18 @@ impl TxMessage {
     /// The action name, for the log.
     pub fn action(&self) -> &'static str {
         match self {
-            TxMessage::Stop(_) => StopTransactionRequest::ACTION,
-            TxMessage::Sample(_) => MeterValuesRequest::ACTION,
+            TxMessage::Start { .. } => StartTransactionRequest::ACTION,
+            TxMessage::Stop { .. } => StopTransactionRequest::ACTION,
+            TxMessage::Sample { .. } => MeterValuesRequest::ACTION,
         }
     }
 
     /// The transaction the message belongs to.
-    pub fn transaction_id(&self) -> Option<i32> {
+    pub fn local(&self) -> u32 {
         match self {
-            TxMessage::Stop(request) => Some(request.transaction_id),
-            TxMessage::Sample(request) => request.transaction_id,
+            TxMessage::Start { local, .. }
+            | TxMessage::Stop { local, .. }
+            | TxMessage::Sample { local, .. } => *local,
         }
     }
 
@@ -250,7 +301,43 @@ impl TxMessage {
     /// sample may go: the next one carries a newer register, while a
     /// StopTransaction carries the meterStop the CSMS bills.
     pub fn is_sample(&self) -> bool {
-        matches!(self, TxMessage::Sample(_))
+        matches!(self, TxMessage::Sample { .. })
+    }
+
+    /// The request to send, with the transaction ID the CSMS gave, or -1
+    /// if it never gave one (errata 3.18).
+    ///
+    /// Measurand, unit and context of a sample are written out although
+    /// they are the defaults of section 4.7, so a CSMS need not know the
+    /// defaults to read the value.
+    pub fn outgoing(&self, ids: &TxIds) -> Outgoing {
+        let transaction_id = ids.resolve(self.local());
+        match self {
+            TxMessage::Start { request, .. } => Outgoing::Start(request.clone()),
+            TxMessage::Stop { data, .. } => Outgoing::Stop(StopTransactionRequest {
+                id_tag: data.id_tag.clone(),
+                meter_stop: data.meter_stop,
+                timestamp: data.timestamp,
+                transaction_id,
+                reason: data.reason,
+            }),
+            TxMessage::Sample { data, .. } => Outgoing::Sample(MeterValuesRequest {
+                connector_id: data.connector.get(),
+                transaction_id: Some(transaction_id),
+                meter_value: vec![MeterValue {
+                    timestamp: data.at,
+                    sampled_value: vec![SampledValue {
+                        value: data.register_wh.to_string(),
+                        context: Some(ReadingContext::SamplePeriodic),
+                        format: None,
+                        measurand: Some(Measurand::EnergyActiveImportRegister),
+                        phase: None,
+                        location: None,
+                        unit: Some(UnitOfMeasure::Wh),
+                    }],
+                }],
+            }),
+        }
     }
 }
 
@@ -279,7 +366,7 @@ mod tests {
 
     fn transaction() -> Transaction {
         Transaction {
-            id: 7,
+            local: 3,
             id_tag: IdTag::new("DEMO-TAG").unwrap(),
             meter_start: 100,
         }
@@ -342,19 +429,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_start_conf_not_accepted_stops_the_transaction() {
-        let response = |status| StartTransactionResponse {
+    fn start_response(status: AuthorizationStatus) -> StartTransactionResponse {
+        StartTransactionResponse {
             id_tag_info: info(status),
             transaction_id: 7,
-        };
+        }
+    }
+
+    /// IDs where transaction 3 has the CSMS ID 7.
+    fn ids() -> TxIds {
+        let mut ids = TxIds::default();
+        ids.on_delivered(3, &start_response(AuthorizationStatus::Accepted));
+        ids
+    }
+
+    #[test]
+    fn a_start_conf_not_accepted_stops_the_transaction() {
+        let mut ids = TxIds::default();
         assert_eq!(
-            on_start_conf(&response(AuthorizationStatus::Accepted)),
+            ids.on_delivered(1, &start_response(AuthorizationStatus::Accepted)),
             StartDecision::Charge
         );
         for status in REFUSED {
             assert_eq!(
-                on_start_conf(&response(status)),
+                ids.on_delivered(1, &start_response(status)),
                 StartDecision::StopDeAuthorized,
                 "{status:?}"
             );
@@ -362,16 +460,33 @@ mod tests {
     }
 
     #[test]
+    fn an_id_is_kept_until_forgotten_and_minus_one_without_one() {
+        let mut ids = ids();
+        assert_eq!(ids.get(3), Some(7));
+        assert_eq!(ids.resolve(3), 7);
+        // Errata 3.18: a transaction whose StartTransaction was never
+        // answered is sent with -1.
+        assert_eq!(ids.get(4), None);
+        assert_eq!(ids.resolve(4), -1);
+        ids.forget(3);
+        assert_eq!(ids.get(3), None);
+    }
+
+    #[test]
     fn a_stop_by_the_user_carries_the_id_tag_and_no_reason() {
+        let message = TxMessage::Stop {
+            local: 3,
+            data: stop(&transaction(), StopCause::Local, 346, AT),
+        };
         assert_eq!(
-            stop(&transaction(), StopCause::Local, 346, AT),
-            StopTransactionRequest {
+            message.outgoing(&ids()),
+            Outgoing::Stop(StopTransactionRequest {
                 id_tag: Some("DEMO-TAG".into()),
                 meter_stop: 346,
                 timestamp: AT,
                 transaction_id: 7,
                 reason: None,
-            }
+            })
         );
     }
 
@@ -382,7 +497,13 @@ mod tests {
             (StopCause::DeAuthorized, StopReason::DeAuthorized),
         ];
         for (cause, reason) in causes {
-            let request = stop(&transaction(), cause, 100, AT);
+            let message = TxMessage::Stop {
+                local: 3,
+                data: stop(&transaction(), cause, 100, AT),
+            };
+            let Outgoing::Stop(request) = message.outgoing(&ids()) else {
+                panic!("not a stop");
+            };
             assert_eq!(request.reason, Some(reason));
             assert_eq!(request.id_tag, None);
             assert_eq!(request.transaction_id, 7);
@@ -392,7 +513,13 @@ mod tests {
 
     #[test]
     fn a_sample_carries_the_register_of_the_transaction() {
-        let request = sample(ONE, &transaction(), 246, AT);
+        let message = TxMessage::Sample {
+            local: 3,
+            data: sample(ONE, 246, AT),
+        };
+        let Outgoing::Sample(request) = message.outgoing(&ids()) else {
+            panic!("not a sample");
+        };
         assert_eq!(
             serde_json::to_value(request).unwrap(),
             serde_json::json!({
@@ -412,15 +539,58 @@ mod tests {
     }
 
     #[test]
+    fn messages_without_an_id_go_with_minus_one() {
+        let ids = TxIds::default();
+        let stop = TxMessage::Stop {
+            local: 3,
+            data: stop(&transaction(), StopCause::Local, 346, AT),
+        };
+        let Outgoing::Stop(request) = stop.outgoing(&ids) else {
+            panic!("not a stop");
+        };
+        assert_eq!(request.transaction_id, -1);
+        let sample = TxMessage::Sample {
+            local: 3,
+            data: sample(ONE, 246, AT),
+        };
+        let Outgoing::Sample(request) = sample.outgoing(&ids) else {
+            panic!("not a sample");
+        };
+        assert_eq!(request.transaction_id, Some(-1));
+    }
+
+    #[test]
     fn a_queued_message_names_its_action_and_transaction() {
-        let stop = TxMessage::Stop(stop(&transaction(), StopCause::Local, 346, AT));
+        let stop = TxMessage::Stop {
+            local: 3,
+            data: stop(&transaction(), StopCause::Local, 346, AT),
+        };
         assert_eq!(stop.action(), "StopTransaction");
-        assert_eq!(stop.transaction_id(), Some(7));
+        assert_eq!(stop.local(), 3);
         assert!(!stop.is_sample());
 
-        let sample = TxMessage::Sample(sample(ONE, &transaction(), 246, AT));
+        let sample = TxMessage::Sample {
+            local: 3,
+            data: sample(ONE, 246, AT),
+        };
         assert_eq!(sample.action(), "MeterValues");
-        assert_eq!(sample.transaction_id(), Some(7));
+        assert_eq!(sample.local(), 3);
         assert!(sample.is_sample());
+    }
+
+    #[test]
+    fn a_queued_start_goes_out_as_it_was_built() {
+        let request = start(ONE, &IdTag::new("Card-42").unwrap(), 246, AT);
+        let message = TxMessage::Start {
+            local: 3,
+            request: request.clone(),
+        };
+        assert_eq!(message.action(), "StartTransaction");
+        assert_eq!(message.local(), 3);
+        assert!(!message.is_sample());
+        assert_eq!(
+            message.outgoing(&TxIds::default()),
+            Outgoing::Start(request)
+        );
     }
 }
