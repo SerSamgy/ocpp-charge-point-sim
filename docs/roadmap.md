@@ -101,6 +101,7 @@ instead.
          before it only. Every missed point gets its own sample (it was one
          for all of them); `sample_queue_limit` 30 → 1440 (four hours at
          10 s).
+         [#21](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/21)
 
 ## Hardware and system track
 
