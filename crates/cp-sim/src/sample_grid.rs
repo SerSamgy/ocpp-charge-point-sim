@@ -73,10 +73,6 @@ impl SampleGrid {
     /// At most `keep_last` points are returned (0 counts as 1); when more are
     /// due, the oldest are only counted, without computing them, so a long
     /// gap costs no more than a short one.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used by session in the next commit")
-    )]
     pub fn take_before(&mut self, until: UtcDateTime, keep_last: usize) -> Taken {
         self.take(until, false, keep_last)
     }
