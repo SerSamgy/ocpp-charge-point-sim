@@ -92,6 +92,7 @@ instead.
          CSMS. Done: a deauthorization stops the transaction at the time of
          the answer, a fault then clears to Finishing, and the test CSMS
          answers a repeated start with the same ID.
+         [#20](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/20)
    - [ ] **5c3.** MeterValues for the sample ticks that fall while the
          station is offline (section 3.7), computed when the waiting inputs
          are applied after the reconnect, at the points of the sample grid
