@@ -25,6 +25,7 @@ mod status16;
 mod test_support;
 mod timestamp;
 mod transaction16;
+mod tx_queue;
 
 use std::{io, time::Duration};
 
@@ -53,6 +54,14 @@ const SETTINGS: Settings = Settings {
     // MeterValueSampleInterval. Real stations use 1 to 5 minutes (1.6
     // section 3.16.1); 10 s shows the progress quickly when trying it out.
     meter_sample_interval: Duration::from_secs(10),
+    // TransactionMessageAttempts as in the example of 1.6 section 3.7.1;
+    // TransactionMessageRetryInterval 10 s instead of its 60 s, so retries
+    // show quickly when trying them out (wait 10 s, then 20 s).
+    transaction_attempts: 3,
+    transaction_retry_interval: Duration::from_secs(10),
+    // 5 minutes of samples at 10 s: bounds the memory and how long `start`
+    // waits behind a failing CSMS.
+    sample_queue_limit: 30,
 };
 
 #[tokio::main]

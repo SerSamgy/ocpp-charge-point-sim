@@ -5,6 +5,7 @@ from collections import defaultdict
 from datetime import UTC, datetime
 
 import websockets
+from ocpp.exceptions import InternalError
 from ocpp.routing import on
 from ocpp.v16 import ChargePoint as cp
 from ocpp.v16 import call_result
@@ -44,6 +45,35 @@ def id_tags(name: str) -> set[str]:
 # Every other idTag is Accepted.
 BLOCKED_ID_TAGS = id_tags("BLOCKED_ID_TAGS")
 START_REJECTED_ID_TAGS = id_tags("START_REJECTED_ID_TAGS")
+
+
+def fail_counts(name: str) -> dict[str, int]:
+    """`Action=N,Action=N` from the environment."""
+    counts = {}
+    for item in os.environ.get(name, "").split(","):
+        if item.strip():
+            action, _, count = item.partition("=")
+            counts[action.strip()] = int(count)
+    return counts
+
+
+# Failures on demand, for testing the client's retries (section 3.7.1):
+#   FAIL_FIRST=StopTransaction=2,MeterValues=1   the first 2 StopTransaction
+#                                                and the first MeterValues of
+#                                                this run get a CALLERROR
+#                                                (InternalError)
+FAIL_FIRST = fail_counts("FAIL_FIRST")
+
+
+def fail_first(action: str) -> None:
+    """Raises, so the `ocpp` library answers with CALLERROR, while the
+    failures FAIL_FIRST asks for `action` are not used up yet."""
+    left = FAIL_FIRST.get(action, 0)
+    if left > 0:
+        FAIL_FIRST[action] = left - 1
+        logger.warning(f"{action}: failing on demand, {left - 1} failures left")
+        raise InternalError(description="failing on demand (FAIL_FIRST)")
+
 
 # Transaction IDs are unique per CSMS run, starting at 1.
 next_transaction_id = 1
@@ -156,6 +186,7 @@ class ChargePoint(cp):
 
     @on(Action.meter_values)
     def on_meter_values(self, connector_id, meter_value, **kwargs):
+        fail_first("MeterValues")
         transaction_id = kwargs.get("transaction_id")
         if transaction_id is not None and transaction_id not in open_transactions:
             logger.warning(
@@ -185,6 +216,7 @@ class ChargePoint(cp):
 
     @on(Action.stop_transaction)
     def on_stop_transaction(self, meter_stop, timestamp, transaction_id, **kwargs):
+        fail_first("StopTransaction")
         reason = kwargs.get("reason", "Local (absent)")
         id_tag = kwargs.get("id_tag")
         started = open_transactions.pop(transaction_id, None)

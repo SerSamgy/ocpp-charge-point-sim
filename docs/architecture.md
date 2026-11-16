@@ -28,7 +28,8 @@ Layered from the wire up; each module uses only the ones above it.
 | `pending` | `PendingCalls`: outstanding CALLs by message ID, each waiting on a `oneshot` channel. | No. |
 | `client` | One WebSocket connection: `Client::call` sends a typed request and waits for the typed answer; the reader task routes incoming frames; `Client::close` sends a Close frame with a status code. | Partly: sub-protocol `ocpp1.6`, `ocpp16::Request`. |
 | `boot` | Maps a BootNotification response to the next step (Accepted, Pending, Rejected). | Yes, 1.6 section 4.2. |
-| `transaction16` | 1.6 transactions: `IdTag` (1 to 20 characters), `Transaction` (ID from the CSMS, idTag, meter at the start), the Authorize, StartTransaction, StopTransaction and MeterValues requests (`sample`: the energy register in Wh, sampled periodically), and what an answer means (`authorized`, `on_start_conf`: charge or stop with DeAuthorized; the `reason` and `idTag` of a stop). Pure. Behaves as if `StopTransactionOnInvalidId` and `StopTransactionOnEVSideDisconnect` were true, `MeterValuesSampledData` were its default and `StopTxnSampledData`/`StopTxnAlignedData` were empty (no `transactionData`). | Yes. |
+| `transaction16` | 1.6 transactions: `IdTag` (1 to 20 characters), `Transaction` (ID from the CSMS, idTag, meter at the start), the Authorize, StartTransaction, StopTransaction and MeterValues requests (`sample`: the energy register in Wh, sampled periodically), `TxMessage` (StopTransaction or MeterValues waiting in the queue; only a sample may be dropped by the limit), and what an answer means (`authorized`, `on_start_conf`: charge or stop with DeAuthorized; the `reason` and `idTag` of a stop). Pure. Behaves as if `StopTransactionOnInvalidId` and `StopTransactionOnEVSideDisconnect` were true, `MeterValuesSampledData` were its default and `StopTxnSampledData`/`StopTxnAlignedData` were empty (no `transactionData`). | Yes. |
+| `tx_queue` | `TxQueue<M>`: transaction-related messages in order; only the head waits after a failure, for the retry interval times its transmissions so far; discarded after the last attempt (1.6 sections 3.7, 3.7.1); `push_limited` bounds selected messages, oldest dropped first. Pure, instants passed in, generic over the message. | No: 2.0.1 can queue TransactionEvent in it. |
 | `status16` | Maps a connector state and the instant it was reached to a 1.6 StatusNotification request; `report` builds the list sent after Accepted and after a reconnect (errata 3.22): connector 0, then every connector. Connector 0 is not representable by `status_notification`. | Yes, through `connector` and `ocpp16`. |
 | `backoff` | Wait before a reconnect, OCPP-J 2.0.1 part 4 section 5.4. | No, a transport rule. |
 | `session` | Stays connected until a shutdown signal: connect, boot until Accepted, report the status of connector 0 and the connector, apply keyboard commands and report each one, start and stop transactions, sample the meter during a transaction (MeterValues every `meter_sample_interval`, 10 s in `main`), Heartbeat, reconnect; on the signal, close the connection and return. Owns the state that survives a connection (`Station`: connector, meter, open transaction and its sampler, undelivered StopTransaction). | Yes, through `boot`, `transaction16` and `ocpp16`. |
@@ -49,18 +50,21 @@ not a pre-formatted string.
   (connected, boot accepted, reconnecting, a connector changed state,
   transaction started with `transaction_id`, `id_tag`, `meter_start`,
   transaction stopped with `transaction_id`, `meter_stop`, `energy_wh`,
-  `reason`, meter sampled with `transaction_id`, `register_wh`, shutting
-  down).
+  `reason`, meter sampled with `transaction_id`, `register_wh`, a
+  transaction message delivered after failed transmissions with `action`,
+  `transaction_id`, `after_failures`, shutting down).
 - `warn`: a failure that the program survives (a CALL that failed, a
-  StopTransaction that will be retried, a meter sample interval too large to
-  use, a malformed frame, no connection).
+  transaction message that will be retried with `action`, `transaction_id`,
+  `retry_in`, one discarded after its last attempt with `attempts`, a sample
+  dropped because too many wait, a meter sample interval too large to use, a
+  malformed frame, no connection).
 
 The replies to what the owner types on the keyboard are not log events and
 stay `eprintln!` (`#[expect]` says so at each place), so a filter such as
 `RUST_LOG=error` cannot hide them: help, an unknown command, a line that is
 not UTF-8, an event that does not fit the connector state, and a `start`
 that does not lead to charging (refused, failed, typed offline, invalid
-idTag, previous stop not delivered).
+idTag, transaction messages still queued).
 
 Tests: `test_support::LogCapture` collects the events of the current thread.
 It works through one global forwarding subscriber because `tracing` caches
@@ -111,7 +115,7 @@ Transactions (OCPP 1.6 sections 3.7, 4.1, 4.8, 4.10, errata 3.17):
 2. StartTransaction with the meter reading and the instant of `start`.
    A failed or lost CALL ends here as well (a StartTransaction whose answer
    was lost may have created a transaction the station does not know,
-   errata 3.18, step 5c).
+   errata 3.18, step 5c2).
 3. With the answer, everything is applied before anything is sent: the
    `Transaction`, Charging (the meter starts), and, if the answer does not
    accept the idTag, the stop with reason DeAuthorized and Finishing. Then
@@ -119,25 +123,40 @@ Transactions (OCPP 1.6 sections 3.7, 4.1, 4.8, 4.10, errata 3.17):
    StopTransaction and StatusNotification Finishing.
 4. `stop` (Finishing, reason Local, so absent, with the idTag) or unplugging
    while charging (Available, reason EVDisconnected, no idTag) ends the
-   transaction at once and puts its StopTransaction into `pending_stop`; the
-   StopTransaction goes out before the StatusNotification of the change. A
-   fault pauses the meter but keeps the transaction.
-5. `pending_stop` is cleared only by the CSMS's answer. It goes out first
-   after every reconnect, before the status reports, and after a CALLERROR
-   or timeout again on every Heartbeat tick, whatever the Heartbeat's
-   outcome. Until it is cleared, `start` is refused.
+   transaction at once and queues its StopTransaction; the queue is drained
+   before the StatusNotification of the change. A fault pauses the meter
+   but keeps the transaction.
+5. StopTransaction and MeterValues go through one queue (`tx_queue`,
+   sections 3.7 and 3.7.1). A message leaves it when the CSMS answers it.
+   A CALLERROR (a failure to process, OCPP-J errata 3.3), a timeout or an
+   answer that does not decode is a failed transmission: the message stays
+   at the head and goes again after `transaction_retry_interval` times its
+   transmissions so far, and is discarded after `transaction_attempts`. A
+   lost connection is not a failure: the head goes first on the next
+   connection, before the status reports. A branch of the keep-alive loop
+   sleeps until the head is due. StatusNotification, Heartbeat and
+   Authorize do not wait for the queue (section 3.7 allows it).
+   StartTransaction does not go through the queue yet, so `start` is
+   refused while the queue is not empty: section 3.7 lets a new
+   transaction-related message go only after the queued ones. With a CSMS
+   that keeps failing that wait can be long, up to about an hour with 30
+   samples queued, each needing three timeouts; step 5c2 queues
+   StartTransaction and removes the wait.
 6. While a transaction is open (Charging, and Faulted with the meter
    paused), the `sampler` ticks every `meter_sample_interval`, the first
    time one interval after the start: MeterValues with the register at that
    moment and the wall-clock time. The keep-alive loop polls its branches in
-   a fixed order (`biased`: Heartbeat, input, sample, end of connection), so
+   a fixed order (`biased`: Heartbeat, input, sample, queue, end of
+   connection), so
    an input that waited while a CALL kept the loop busy is applied before an
    overdue sample, and a sample never carries more energy than the
    meterStop of a `stop` typed before it. Ticks missed while busy or
    offline give one sample when the loop polls the sampler again, then the
-   next one a full interval later. Samples are not taken offline, and a
-   failed MeterValues is not retried (step 5c). Zero, or an interval too
-   large to add to the clock, turns sampling off.
+   next one a full interval later. A sample is queued like any
+   transaction-related message; at most `sample_queue_limit` wait, and a
+   new one drops the oldest waiting sample (never a StopTransaction).
+   Samples are not taken offline (step 5c3). Zero, or an interval too large
+   to add to the clock, turns sampling off.
 
 Connection life cycle (`session`): connect → BootNotification until
 Accepted → the undelivered StopTransaction, if any → status reports
@@ -192,11 +211,11 @@ does not check that a test still means what the row says; review does.
 | A failed or lost Authorize or StartTransaction starts no transaction and leaves the connector in Preparing; a CALLERROR or timeout keeps the connection. | `session::connection_lost_during_authorize_starts_no_transaction`, `session::connection_lost_during_start_transaction_starts_no_transaction`, `session::authorize_call_error_keeps_connection`, `session::authorize_timeout_keeps_connection`, `session::start_transaction_call_error_keeps_connection`, `session::start_transaction_timeout_keeps_connection` |
 | `stop` ends the transaction with the idTag and no reason, unplugging while charging with reason EVDisconnected; a fault keeps it. `meterStop` is the meter at that instant: energy flows only while Charging. | `session::stop_ends_the_transaction_with_the_meter_reading`, `session::unplug_while_charging_ends_the_transaction_as_ev_disconnected`, `session::a_fault_keeps_the_transaction_and_its_time_is_not_charged`, `session::the_transaction_survives_a_reconnect`, `transaction16::a_stop_by_the_user_carries_the_id_tag_and_no_reason`, `transaction16::a_stop_by_the_station_has_a_reason_and_no_id_tag`, `meter::a_pause_adds_nothing_and_fractions_are_kept` |
 | A StartTransaction.conf that does not accept the idTag stops the transaction with reason DeAuthorized; the stop is applied before any report is sent, so a lost connection cannot leave it running. | `session::a_start_conf_not_accepted_stops_the_transaction_as_deauthorized`, `session::connection_lost_after_a_deauthorized_start_still_stops_the_transaction`, `transaction16::a_start_conf_not_accepted_stops_the_transaction` |
-| A StopTransaction stays until the CSMS answers it: after a lost connection it goes out first on the next one; after a CALLERROR or timeout the status still goes out and the StopTransaction again on every Heartbeat tick, even when the Heartbeat fails; until then `start` is refused. | `session::connection_lost_during_stop_transaction_sends_it_again`, `session::stop_while_offline_is_sent_first_after_the_reconnect`, `session::stop_transaction_call_error_is_retried_after_the_heartbeat`, `session::stop_transaction_timeout_is_retried_after_the_heartbeat`, `session::stop_transaction_is_retried_even_when_the_heartbeat_fails`, `session::start_is_refused_until_the_stop_is_delivered` |
-| A transaction start, stop and meter sample are logged at `info` with their fields. | `session::a_started_transaction_is_logged_with_its_fields`, `session::a_stopped_transaction_is_logged_with_its_fields`, `session::a_sample_is_logged_with_its_fields` |
+| StopTransaction and MeterValues go through one queue, in order, and stay until the CSMS answers them: after a lost connection the head goes first on the next one, before the reports; after a CALLERROR or timeout the status still goes out and the message again after the retry interval times the transmissions so far (section 3.7.1), whatever the Heartbeats do; after the last attempt it is discarded and logged; while the queue is not empty `start` is refused, and non-transaction messages do not wait. | `session::connection_lost_during_stop_transaction_sends_it_again`, `session::stop_while_offline_is_sent_first_after_the_reconnect`, `session::stop_transaction_call_error_is_retried_after_the_retry_interval`, `session::stop_transaction_timeout_is_retried_after_the_retry_interval`, `session::retries_wait_the_interval_times_the_transmissions`, `session::a_message_is_discarded_after_the_last_attempt`, `session::a_timeout_counts_as_an_attempt_until_discard`, `session::start_is_refused_while_transaction_messages_wait`, `session::non_transaction_messages_do_not_wait_for_the_queue`, `tx_queue::retries_wait_the_interval_times_the_transmissions_then_discard`, `tx_queue::zero_attempts_send_once`, `tx_queue::a_wait_that_overflows_the_clock_discards`, `tx_queue::the_head_is_always_due_at_next_due` |
+| A transaction start, stop, meter sample and a message delivered after failures are logged at `info` with their fields. | `session::a_started_transaction_is_logged_with_its_fields`, `session::a_stopped_transaction_is_logged_with_its_fields`, `session::a_sample_is_logged_with_its_fields`, `session::a_message_delivered_after_failures_is_logged` |
 | During a transaction, and only then, MeterValues carry the energy register of the transaction every interval, the first one interval after the start; a fault keeps sampling with the frozen register; zero turns sampling off and never reaches the tokio interval, nor does an interval that overflows the clock. | `session::meter_values_are_sent_every_interval_during_a_transaction`, `session::the_first_sample_comes_one_interval_after_the_start`, `session::no_meter_values_without_a_transaction`, `session::meter_values_stop_with_the_transaction`, `session::a_deauthorized_start_sends_no_meter_values`, `session::meter_values_during_a_fault_carry_the_frozen_reading`, `session::zero_sample_interval_sends_no_meter_values`, `session::no_sampler_for_zero_or_an_overflowing_period`, `transaction16::a_sample_carries_the_register_of_the_transaction` |
 | An input waiting when a sample is due is applied first, so a sample never carries more than the following meterStop. | `session::a_waiting_stop_goes_before_the_next_sample` |
-| Missed sample ticks give one sample, not a burst; a failed or lost MeterValues keeps the connection or the sampling going with the same transaction. | `session::skipped_ticks_while_offline_send_one_sample`, `session::meter_values_call_error_keeps_connection_and_sampling`, `session::connection_lost_during_meter_values_keeps_sampling` |
+| Missed sample ticks give one sample, not a burst; a failed sample is retried before the newer ones, a sample lost with the connection goes first on the next one; at most `sample_queue_limit` samples wait, the oldest is dropped first, and never a StopTransaction. | `session::skipped_ticks_while_offline_send_one_sample`, `session::a_failed_sample_is_retried_after_the_retry_interval`, `session::a_sample_lost_with_the_connection_goes_first_after_the_reconnect`, `session::the_oldest_sample_is_dropped_when_the_queue_is_full`, `tx_queue::the_limit_drops_the_oldest_limited_messages_only`, `tx_queue::a_limit_of_zero_keeps_the_newest` |
 | The end of the keyboard input does not stop the station or make it spin. | `session::heartbeats_continue_after_the_sender_is_dropped` |
 | The keyboard reader skips a bad line, also one that is not UTF-8, and ends on a read error or when the session is gone. | `keyboard::a_line_that_is_not_utf8_is_skipped_and_reading_goes_on`, `keyboard::a_read_error_ends_the_reader`, `keyboard::a_dropped_receiver_ends_the_reader_after_the_first_line` |
 | Shutdown never waits for a back-off, the wait after Rejected or a connect timeout. | `session::shutdown_during_backoff_returns_at_once`, `session::shutdown_during_rejected_wait_returns_at_once`, `session::shutdown_during_connect_returns_at_once` |
@@ -225,11 +244,15 @@ belongs to the version module, not to `session`. The same goes for
 `status16`: 2.0.1 gets its own mapping from the shared `connector` state
 (Preparing, Charging and Finishing become `Occupied`), and `boot` and
 `status16` move into the version module. The transaction state in
-`Station` (`Transaction`, `pending_stop`, both from `transaction16`) is
+`Station` (`Transaction` and the `TxMessage`s in the queue, both from
+`transaction16`) is
 1.6 too: 2.0.1 replaces it with its own, built on TransactionEvent, where
 the station chooses a string `transactionId`. `meter` and the shared
 `connector` state stay. So do the sampler and `meter_sample_interval`: in
 2.0.1 the same timer drives TransactionEvent(Updated) with
 `SampledDataTxUpdatedInterval`, while the MeterValues message
 (`transaction16::sample`) and the key name `MeterValueSampleInterval` are
-1.6.
+1.6. `TxQueue` stays as well: 2.0.1 retries TransactionEvent with
+`OCPPCommCtrlr.MessageAttempts[TransactionEvent]` and
+`OCPPCommCtrlr.MessageAttemptInterval[TransactionEvent]` instead of
+`TransactionMessageAttempts` and `TransactionMessageRetryInterval`.

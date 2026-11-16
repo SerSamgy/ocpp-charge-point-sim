@@ -70,14 +70,30 @@ instead.
          `StopTxnSampledData` and `StopTxnAlignedData` were empty, section
          3.16.5).
          [#18](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/18)
-   - [ ] **5c.** A queue of transaction-related messages with
-         `TransactionMessageAttempts` and `TransactionMessageRetryInterval`
-         (section 3.7), and a transaction whose ID is not known yet
-         (errata 3.18, `transactionId` -1). This changes the 5a model, where
-         a transaction exists only once StartTransaction is answered, and
-         the 5a tests that rely on it. MeterValues belong in the queue too:
-         since 5b, samples due while offline are not taken, and a failed
-         MeterValues is not retried.
+   - [x] **5c1.** A queue for StopTransaction and MeterValues with
+         `TransactionMessageAttempts` (3) and
+         `TransactionMessageRetryInterval` (10 s), section 3.7.1; discard
+         after the last attempt; at most 30 samples wait. Replaces
+         `pending_stop`. `start` waits for an empty queue.
+         [#19](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/19)
+   - [ ] **5c2.** StartTransaction through the queue: the transaction
+         starts on the station right after Authorize Accepted, and its
+         messages carry `transactionId` -1 if StartTransaction was never
+         answered (errata 3.18). This changes the 5a model, where a
+         transaction exists only once StartTransaction is answered, and the
+         5a tests that rely on it. To settle there: a StartTransaction.conf
+         that is not Accepted may come late, in any connector state,
+         including Faulted, where clearing the fault must not resume
+         charging without a transaction; a retried StartTransaction may
+         open a second transaction in the CSMS if only the answer was lost;
+         the order of status reports around a late DeAuthorized; one place
+         for the transaction ID. Removes the 5c1 wait of `start` for an
+         empty queue, which can last up to about an hour behind a failing
+         CSMS.
+   - [ ] **5c3.** MeterValues for the sample ticks that fall while the
+         station is offline (section 3.7), computed when the waiting inputs
+         are applied after the reconnect, at the points of the sample grid
+         between them.
 
 ## Hardware and system track
 
@@ -129,6 +145,10 @@ Found during the migration inventory; carried over as is
 - [ ] Detect half-open connections with WebSocket ping
       (`WebSocketPingInterval`, OCPP-J 2.0.1 §8.4). Today a connection whose
       peer vanished without a TCP reset is noticed only when a write fails.
+      OCPP-J 1.6 errata 3.11 recommends a `WebSocketPingInterval` below
+      `TransactionMessageAttempts` × `TransactionMessageRetryInterval`, so
+      a half-open connection is found before a queued message is discarded
+      (step 5c1).
 - [ ] Until WebSocket ping exists: treat N consecutive Heartbeat timeouts
       as a lost connection and reconnect, a cheap safety net.
 - [ ] On shutdown, let a CALL in flight finish (up to its timeout)
@@ -154,9 +174,14 @@ Found during the migration inventory; carried over as is
 - [ ] Stop an open transaction on shutdown (Ctrl+C, SIGTERM) with a
       StopTransaction (reason `Local` or `Reboot`); today the CSMS keeps
       it open (step 5a).
-- [ ] An undelivered StopTransaction (`pending_stop`) is lost on shutdown
-      even though the transaction already ended: send it before Close, or
-      keep it on disk (step 5a).
+- [ ] The queue of transaction-related messages is lost on shutdown, so a
+      transaction that already ended may never reach the CSMS: send it
+      before Close, or keep it on disk (steps 5a, 5c1).
+- [ ] A message on which the CSMS drops the connection blocks the queue:
+      a lost connection does not count as a failed attempt (step 5c1).
+- [ ] Retry a transaction message with the same message ID (OCPP-J 1.6
+      errata 3.1 allows it), so a CSMS can tell a retry from a new message;
+      today every CALL gets a new UUID (step 5c1).
 - [ ] Offline authorization: Authorization Cache, Local Authorization List,
       `AllowOfflineTxForUnknownId` (section 3.5). Today a `start` typed
       while offline is dropped (step 5a).
