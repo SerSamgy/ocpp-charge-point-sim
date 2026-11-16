@@ -66,6 +66,11 @@ impl<M> TxQueue<M> {
     /// selects (at least 1, so the newest one always waits): the oldest of
     /// them leave first. Returns the messages that were dropped. Messages
     /// that `limited` does not select are never dropped.
+    ///
+    /// The oldest may be the head while it waits for a retry. The message
+    /// behind it then becomes the head and goes at once, without the rest
+    /// of that wait: fine for samples, where the newer one replaces the
+    /// failed one.
     pub fn push_limited(
         &mut self,
         message: M,
