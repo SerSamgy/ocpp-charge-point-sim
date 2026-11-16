@@ -25,6 +25,14 @@ mod status16;
 mod test_support;
 mod timestamp;
 mod transaction16;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the session queues transaction messages from a later commit on"
+    )
+)]
+mod tx_queue;
 
 use std::{io, time::Duration};
 
