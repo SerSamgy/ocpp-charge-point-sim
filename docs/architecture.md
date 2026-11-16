@@ -48,9 +48,11 @@ not a pre-formatted string.
   the frame text.
 - `info`: the life of the connection, of the connector and of a transaction
   (connected, boot accepted, reconnecting, a connector changed state,
-  transaction started with `transaction_id`, `id_tag`, `meter_start`,
-  transaction stopped with `transaction_id`, `meter_stop`, `energy_wh`,
-  `reason`, meter sampled with `transaction_id`, `register_wh`, a
+  transaction started with `local`, `id_tag`, `meter_start`, transaction
+  confirmed with `local`, `transaction_id`,
+  transaction stopped with `local`, `transaction_id` (-1 while the CSMS has
+  not given one), `meter_stop`, `energy_wh`, `reason`, meter sampled with
+  `local`, `transaction_id`, `register_wh`, a
   transaction message delivered after failed transmissions with `action`,
   `transaction_id`, `after_failures`, shutting down).
 - `warn`: a failure that the program survives (a CALL that failed, a
@@ -107,26 +109,37 @@ that waited is dropped with a message: there is no offline authorization.
 If stdin ends, the sender is dropped and `session` stops listening to the
 channel for good; the station keeps running.
 
-Transactions (OCPP 1.6 sections 3.7, 4.1, 4.8, 4.10, errata 3.17):
+Transactions (OCPP 1.6 sections 3.7, 4.1, 4.8, 4.10, errata 3.17, 3.18):
 
 1. `start [idTag]` in Preparing, on a live connection: Authorize. Anything
    but Accepted, or a failed CALL, ends here; the connector stays in
    Preparing.
-2. StartTransaction with the meter reading and the instant of `start`.
-   A failed or lost CALL ends here as well (a StartTransaction whose answer
-   was lost may have created a transaction the station does not know,
-   errata 3.18, step 5c2).
-3. With the answer, everything is applied before anything is sent: the
-   `Transaction`, Charging (the meter starts), and, if the answer does not
-   accept the idTag, the stop with reason DeAuthorized and Finishing. Then
-   the frames go out: StatusNotification Charging, and for DeAuthorized
-   StopTransaction and StatusNotification Finishing.
+2. Accepted: the transaction starts on the station at once (section 4.1
+   asks only for the authorization), all before anything is sent: a
+   `Transaction` with the station's own number (`local`), Charging (the
+   meter and the sampler start), and StartTransaction with the meter
+   reading and the instant of `start` in the queue, behind whatever waits
+   there. The queue is drained, then the Charging report goes out. The
+   CSMS ID comes with the answer and is kept in `TxIds`, the one place for
+   it; a message of a transaction whose StartTransaction was discarded
+   goes with -1 (errata 3.18).
+3. An answer that does not accept the idTag stops the transaction it
+   belongs to with reason DeAuthorized, at the time the station learns it,
+   if that transaction is still going on (errata 3.17): from Charging to
+   Finishing; in Faulted the status stays, but the fault clears to
+   Finishing instead of Charging (`State::without_charging`). A
+   transaction that already ended, or a newer one, is left alone. The
+   reports this causes go after the caller's own, except that a report of
+   the caller replaced by a later one of the same connector is left out:
+   an immediate DeAuthorized shows as StartTransaction, StopTransaction,
+   Finishing, without a Charging of next to no time (errata 3.19). After a
+   reconnect they are dropped, since the status reports follow anyway.
 4. `stop` (Finishing, reason Local, so absent, with the idTag) or unplugging
    while charging (Available, reason EVDisconnected, no idTag) ends the
    transaction at once and queues its StopTransaction; the queue is drained
    before the StatusNotification of the change. A fault pauses the meter
    but keeps the transaction.
-5. StopTransaction and MeterValues go through one queue (`tx_queue`,
+5. StartTransaction, StopTransaction and MeterValues go through one queue (`tx_queue`,
    sections 3.7 and 3.7.1). A message leaves it when the CSMS answers it.
    A CALLERROR (a failure to process, OCPP-J errata 3.3), a timeout or an
    answer that does not decode is a failed transmission: the message stays
@@ -135,13 +148,10 @@ Transactions (OCPP 1.6 sections 3.7, 4.1, 4.8, 4.10, errata 3.17):
    lost connection is not a failure: the head goes first on the next
    connection, before the status reports. A branch of the keep-alive loop
    sleeps until the head is due. StatusNotification, Heartbeat and
-   Authorize do not wait for the queue (section 3.7 allows it).
-   StartTransaction does not go through the queue yet, so `start` is
-   refused while the queue is not empty: section 3.7 lets a new
-   transaction-related message go only after the queued ones. With a CSMS
-   that keeps failing that wait can be long, up to about an hour with 30
-   samples queued, each needing three timeouts; step 5c2 queues
-   StartTransaction and removes the wait.
+   Authorize do not wait for the queue (section 3.7 allows it). A retried
+   StartTransaction may open a second transaction in a CSMS that processed
+   the first and lost only its answer; the test CSMS answers a repeated
+   start with the same ID.
 6. While a transaction is open (Charging, and Faulted with the meter
    paused), the `sampler` ticks every `meter_sample_interval`, the first
    time one interval after the start: MeterValues with the register at that
@@ -205,9 +215,9 @@ does not check that a test still means what the row says; review does.
 | Every frame on the wire is logged at `debug` with its direction (`out` or `in`) and text. | `client::frames_are_logged_with_their_direction` |
 | A connector state change is logged at `info` with the connector, the old and the new state as fields. | `session::state_change_is_logged_with_its_fields` |
 | `RUST_LOG` overrides the default filter; blank means the default; a malformed value stops the program at startup and names the value. | `logging::default_filter_logs_debug_of_this_crate`, `logging::blank_value_means_the_default`, `logging::rust_log_overrides_the_default`, `logging::malformed_directives_are_an_error` |
-| On shutdown the client closes an open connection with 1001 Going Away and does not wait for a CALL in flight. An open transaction is not stopped and an undelivered StopTransaction is lost (backlog). | `session::shutdown_closes_connection_and_returns`, `session::shutdown_during_boot_call_closes_connection`, `session::shutdown_during_heartbeat_call_closes_connection`, `session::shutdown_during_report_closes_connection`, `session::shutdown_during_status_notification_closes_connection`, `session::shutdown_during_authorize_closes_connection`, `session::shutdown_during_start_transaction_closes_connection`, `session::shutdown_during_stop_transaction_closes_connection`, `session::shutdown_during_meter_values_closes_connection` |
+| On shutdown the client closes an open connection with 1001 Going Away and does not wait for a CALL in flight. An open transaction is not stopped and the queue is lost, so an undelivered StopTransaction, or a StartTransaction of a transaction that already delivered energy, never reaches the CSMS (backlog). | `session::shutdown_closes_connection_and_returns`, `session::shutdown_during_boot_call_closes_connection`, `session::shutdown_during_heartbeat_call_closes_connection`, `session::shutdown_during_report_closes_connection`, `session::shutdown_during_status_notification_closes_connection`, `session::shutdown_during_authorize_closes_connection`, `session::shutdown_during_start_transaction_closes_connection`, `session::shutdown_during_stop_transaction_closes_connection`, `session::shutdown_during_meter_values_closes_connection` |
 | A keyboard command is applied only after Accepted. On a live connection a valid command other than `start` sends one StatusNotification carrying the instant it was typed (after the StopTransaction, if it ends a transaction); a command that does not fit sends nothing and changes nothing; commands that waited are applied in order and reported once, with the instant of the last one. | `session::input_sends_status_notification`, `session::invalid_event_sends_nothing`, `session::fault_reports_the_error_code_and_clear_returns_to_the_pre_fault_state`, `session::inputs_wait_until_boot_is_accepted`, `session::inputs_while_offline_are_reported_once_with_the_time_of_the_last_one`, `session::connection_lost_during_an_input_report_reports_the_new_state_again` |
-| The connector charges only in a transaction the CSMS has answered, and only for an idTag it authorized: `start` sends Authorize, then StartTransaction, then StatusNotification Charging; a refused idTag, a `start` outside Preparing, an invalid idTag or a `start` typed offline sends nothing more. | `session::start_authorizes_then_starts_the_transaction_then_charges`, `session::a_refused_id_tag_starts_nothing`, `session::start_outside_preparing_sends_nothing`, `session::an_invalid_id_tag_sends_nothing`, `session::start_while_offline_is_ignored`, `transaction16::only_accepted_is_authorized` |
+| The connector charges only in a transaction, and only for an idTag the CSMS authorized: `start` sends Authorize, then StartTransaction (through the queue), then StatusNotification Charging; a refused idTag, a `start` outside Preparing, an invalid idTag or a `start` typed offline sends nothing more. | `session::start_authorizes_then_starts_the_transaction_then_charges`, `session::a_refused_id_tag_starts_nothing`, `session::start_outside_preparing_sends_nothing`, `session::an_invalid_id_tag_sends_nothing`, `session::start_while_offline_is_ignored`, `transaction16::only_accepted_is_authorized` |
 | A failed or lost Authorize starts no transaction and leaves the connector in Preparing; a CALLERROR or timeout keeps the connection. Once Authorize is accepted the transaction starts on the station and its StartTransaction goes through the queue: a failed one is retried while the connector charges, one lost with the connection goes first on the next. | `session::connection_lost_during_authorize_starts_no_transaction`, `session::authorize_call_error_keeps_connection`, `session::authorize_timeout_keeps_connection`, `session::connection_lost_during_start_transaction_sends_it_first_after_the_reconnect`, `session::a_start_transaction_call_error_is_retried_while_charging`, `session::a_start_transaction_timeout_is_retried_while_charging`, `session::messages_wait_behind_an_undelivered_start_and_get_its_id`, `session::a_discarded_start_gives_minus_one_to_its_stop`, `transaction16::an_id_is_kept_until_forgotten_and_minus_one_without_one`, `transaction16::messages_without_an_id_go_with_minus_one` |
 | `stop` ends the transaction with the idTag and no reason, unplugging while charging with reason EVDisconnected; a fault keeps it. `meterStop` is the meter at that instant: energy flows only while Charging. | `session::stop_ends_the_transaction_with_the_meter_reading`, `session::unplug_while_charging_ends_the_transaction_as_ev_disconnected`, `session::a_fault_keeps_the_transaction_and_its_time_is_not_charged`, `session::the_transaction_survives_a_reconnect`, `transaction16::a_stop_by_the_user_carries_the_id_tag_and_no_reason`, `transaction16::a_stop_by_the_station_has_a_reason_and_no_id_tag`, `meter::a_pause_adds_nothing_and_fractions_are_kept` |
 | A StartTransaction.conf that does not accept the idTag stops the transaction it belongs to with reason DeAuthorized, at the time of the answer, if it is still going on: from Charging to Finishing (the Charging of next to no time is not reported), and in Faulted the fault then clears to Finishing, not to Charging; a transaction that already ended, or a newer one, is left alone; the stop is applied before any report is sent, so a lost connection cannot leave it running. | `session::a_start_conf_not_accepted_stops_the_transaction_as_deauthorized`, `session::connection_lost_after_a_deauthorized_start_still_stops_the_transaction`, `session::a_late_start_conf_not_accepted_stops_the_ongoing_transaction`, `session::a_late_deauthorization_during_a_fault_does_not_resume_charging`, `session::a_late_deauthorization_after_stop_changes_nothing`, `session::a_late_deauthorization_of_an_old_transaction_leaves_the_new_one_charging`, `session::a_start_answered_blocked_after_a_reconnect_stops_the_transaction`, `transaction16::a_start_conf_not_accepted_stops_the_transaction`, `connector::without_charging_never_charges_and_changes_nothing_else` |

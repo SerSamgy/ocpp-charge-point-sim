@@ -851,7 +851,7 @@ impl Station<'_> {
 /// The connector event a keyboard command stands for; `None` for `start`,
 /// which changes the connector only through a transaction. No command
 /// stands for `StartCharging`: only `Station::present` produces it, after
-/// the CSMS has answered StartTransaction, so a Charging connector always
+/// the CSMS has accepted the idTag in Authorize, so a Charging connector always
 /// has a transaction.
 fn event(command: &Command) -> Option<Event> {
     match command {
