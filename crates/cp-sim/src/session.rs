@@ -2253,6 +2253,9 @@ mod tests {
 
     // --- MeterValues ---
 
+    /// How long `recv_skipping` waits for a CALL it does not skip.
+    const SKIP_LIMIT: Duration = Duration::from_secs(10);
+
     /// The sample interval of the sampling tests: short, and not a divisor
     /// of the 1 s Heartbeat, so the two rarely tick together.
     const SAMPLE: Duration = Duration::from_millis(250);
@@ -2279,12 +2282,19 @@ mod tests {
     }
 
     /// The next CALL whose action is not in `skip`; the skipped ones are
-    /// answered. Returns its action, ID and payload.
+    /// answered. Returns its action, ID and payload. Panics if none comes
+    /// within `SKIP_LIMIT`, so a message that never comes fails the test
+    /// instead of hanging it on an endless stream of Heartbeats.
     async fn recv_skipping(
         csms: &mut FakeCsms,
         skip: &[&str],
     ) -> (String, String, serde_json::Value) {
+        let deadline = Instant::now() + SKIP_LIMIT;
         loop {
+            assert!(
+                Instant::now() < deadline,
+                "only {skip:?} for {SKIP_LIMIT:?}"
+            );
             match csms.recv_event_within(HEARTBEAT_WAIT).await {
                 Event::Frame(Frame::Call {
                     id,
