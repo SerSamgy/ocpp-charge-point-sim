@@ -49,6 +49,30 @@ START_REJECTED_ID_TAGS = id_tags("START_REJECTED_ID_TAGS")
 next_transaction_id = 1
 # Open transactions: ID -> (charge point ID, idTag, meterStart).
 open_transactions: dict[int, tuple[str, str, int]] = {}
+# The last energy register reported per open transaction, in Wh.
+last_register: dict[int, float] = {}
+
+# Section 4.7: a sampled value without these fields is a register reading
+# of active import energy in Wh.
+ENERGY_REGISTER = "Energy.Active.Import.Register"
+
+
+def energy_register_wh(sampled_value: dict) -> float | None:
+    """The value in Wh if it is the active import energy register, else None.
+    The value is a string (it may be signed data), so a non-number is None."""
+    if sampled_value.get("measurand", ENERGY_REGISTER) != ENERGY_REGISTER:
+        return None
+    unit = sampled_value.get("unit", "Wh")
+    try:
+        value = float(sampled_value["value"])
+    except KeyError, ValueError:
+        return None
+    if unit == "Wh":
+        return value
+    if unit == "kWh":
+        return value * 1000
+    return None
+
 
 # BootNotifications received per charge point ID. Kept across connections,
 # because a rejected charge point reconnects before booting again.
@@ -130,11 +154,46 @@ class ChargePoint(cp):
             transaction_id=transaction_id, id_tag_info=IdTagInfo(status=status)
         )
 
+    @on(Action.meter_values)
+    def on_meter_values(self, connector_id, meter_value, **kwargs):
+        transaction_id = kwargs.get("transaction_id")
+        if transaction_id is not None and transaction_id not in open_transactions:
+            logger.warning(
+                f"MeterValues from {self.id} for unknown or closed transaction_id={transaction_id}"
+            )
+        for sample in meter_value:
+            for sampled_value in sample["sampled_value"]:
+                logger.info(
+                    f"MeterValues from {self.id}: connector={connector_id} "
+                    f"transaction_id={transaction_id} timestamp={sample['timestamp']} "
+                    f"{sampled_value.get('measurand', ENERGY_REGISTER)}="
+                    f"{sampled_value['value']} {sampled_value.get('unit', 'Wh')}"
+                )
+                register = energy_register_wh(sampled_value)
+                if register is None or transaction_id not in open_transactions:
+                    continue
+                previous = last_register.get(transaction_id)
+                if previous is not None and register < previous:
+                    logger.warning(
+                        f"energy register of transaction_id={transaction_id} went "
+                        f"down from {previous} to {register} Wh"
+                    )
+                last_register[transaction_id] = register
+        # Always an ordinary answer: an error would only make the charge
+        # point send the same values again (section 4.7).
+        return call_result.MeterValues()
+
     @on(Action.stop_transaction)
     def on_stop_transaction(self, meter_stop, timestamp, transaction_id, **kwargs):
         reason = kwargs.get("reason", "Local (absent)")
         id_tag = kwargs.get("id_tag")
         started = open_transactions.pop(transaction_id, None)
+        last_sampled = last_register.pop(transaction_id, None)
+        if last_sampled is not None and meter_stop < last_sampled:
+            logger.warning(
+                f"meter_stop={meter_stop} of transaction_id={transaction_id} is below "
+                f"the last MeterValues register {last_sampled} Wh"
+            )
         if started is None:
             # A repeated or unknown StopTransaction still gets an ordinary
             # answer: an error would make the charge point send it again
