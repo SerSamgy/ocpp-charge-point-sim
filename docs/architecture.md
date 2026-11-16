@@ -277,8 +277,8 @@ belongs to the version module, not to `session`. The same goes for
 `transaction16`) is
 1.6 too: 2.0.1 replaces it with its own, built on TransactionEvent, where
 the station chooses a string `transactionId`. `meter` and the shared
-`connector` state stay. So do the sampler and `meter_sample_interval`: in
-2.0.1 the same timer drives TransactionEvent(Updated) with
+`connector` state stay. So do `sample_grid` and `meter_sample_interval`: in
+2.0.1 the same grid drives TransactionEvent(Updated) with
 `SampledDataTxUpdatedInterval`, while the MeterValues message
 (`transaction16::sample`) and the key name `MeterValueSampleInterval` are
 1.6. `TxQueue` stays as well: 2.0.1 retries TransactionEvent with
