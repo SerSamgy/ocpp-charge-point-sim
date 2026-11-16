@@ -489,7 +489,16 @@ impl Station<'_> {
             let err = match sent {
                 Ok(()) => {
                     self.backoff.reset();
-                    self.queue.delivered();
+                    // Every sample would log here; only the end of a
+                    // message that had failed is news.
+                    if let Some((_, failures @ 1..)) = self.queue.delivered() {
+                        info!(
+                            action = message.action(),
+                            transaction_id = message.transaction_id(),
+                            after_failures = failures,
+                            "transaction message delivered"
+                        );
+                    }
                     continue;
                 }
                 Err(CallFailure::Disconnected) => return Err(Ended::Lost),
@@ -2033,6 +2042,39 @@ mod tests {
         ] {
             assert!(line.contains(field), "{field} missing in: {line}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_message_delivered_after_failures_is_logged() {
+        let logs = LogCapture::start(EnvFilter::new("cp_sim=info"));
+        let mut csms = FakeCsms::start().await;
+        let (inputs, _cp) = spawn_run_inputs(&csms.url, settings(LONG));
+        connect_and_accept(&mut csms).await;
+        start_charging(&mut csms, &inputs).await;
+
+        inputs.send(input(Command::Stop, T0 + 180)).await.unwrap();
+        let (_, id, _) = recv_skipping(&mut csms, &["Heartbeat"]).await;
+        csms.send(call_error(&id));
+        let (_, id, _) = recv_skipping(&mut csms, &["Heartbeat", "StatusNotification"]).await;
+        csms.send(empty_result(&id));
+        // The line is written once the answer is in: wait for the next
+        // frame, which comes after it.
+        call_id(csms.recv_event_within(HEARTBEAT_WAIT).await, "Heartbeat");
+
+        let text = logs.text();
+        let line = text
+            .lines()
+            .find(|l| l.contains("transaction message delivered"));
+        let line = line.unwrap_or_else(|| panic!("no delivery in the log:\n{text}"));
+        for field in [
+            "action=\"StopTransaction\"",
+            "transaction_id=7",
+            "after_failures=1",
+        ] {
+            assert!(line.contains(field), "{field} missing in: {line}");
+        }
+        // A message that went through at once is not logged.
+        assert_eq!(text.matches("transaction message delivered").count(), 1);
     }
 
     #[tokio::test]

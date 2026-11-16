@@ -121,9 +121,12 @@ impl<M> TxQueue<M> {
         Some(head.retry_at.map_or(now, |retry_at| retry_at.max(now)))
     }
 
-    /// The CSMS answered the head: it leaves the queue.
-    pub fn delivered(&mut self) -> Option<M> {
-        self.entries.pop_front().map(|e| e.message)
+    /// The CSMS answered the head: it leaves the queue. Returns it with the
+    /// number of transmissions that had failed before this one.
+    pub fn delivered(&mut self) -> Option<(M, u32)> {
+        self.entries
+            .pop_front()
+            .map(|e| (e.message, e.transmissions))
     }
 
     /// The head failed at `now`. `None` for an empty queue.
@@ -176,9 +179,9 @@ mod tests {
         q.push("start");
         q.push("stop");
         assert_eq!(q.head_due(now), Some(&"start"));
-        assert_eq!(q.delivered(), Some("start"));
+        assert_eq!(q.delivered(), Some(("start", 0)));
         assert_eq!(q.head_due(now), Some(&"stop"));
-        assert_eq!(q.delivered(), Some("stop"));
+        assert_eq!(q.delivered(), Some(("stop", 0)));
         assert!(q.is_empty());
         assert_eq!(q.next_due(now), None);
     }
@@ -209,6 +212,16 @@ mod tests {
         );
         // The next message goes at once: it has not failed yet.
         assert_eq!(q.head_due(t2), Some(&"next"));
+    }
+
+    #[test]
+    fn delivered_tells_how_many_transmissions_had_failed() {
+        let mut q = queue(3);
+        let t0 = Instant::now();
+        q.push("stop");
+        q.failed(t0);
+        q.failed(t0 + MINUTE);
+        assert_eq!(q.delivered(), Some(("stop", 2)));
     }
 
     #[test]
@@ -294,7 +307,7 @@ mod tests {
         // A message the limit does not select is never dropped.
         assert!(q.push_limited("stop 2", is_sample, 2).is_empty());
         assert_eq!(q.len(), 4);
-        let order: Vec<_> = std::iter::from_fn(|| q.delivered()).collect();
+        let order: Vec<_> = std::iter::from_fn(|| q.delivered().map(|(m, _)| m)).collect();
         assert_eq!(order, ["stop", "sample 2", "sample 3", "stop 2"]);
     }
 
