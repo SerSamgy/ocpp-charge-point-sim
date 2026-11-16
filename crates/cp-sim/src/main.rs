@@ -19,6 +19,7 @@ mod logging;
 mod meter;
 mod ocpp16;
 mod pending;
+mod sample_grid;
 mod session;
 mod status16;
 #[cfg(test)]
@@ -59,9 +60,14 @@ const SETTINGS: Settings = Settings {
     // show quickly when trying them out (wait 10 s, then 20 s).
     transaction_attempts: 3,
     transaction_retry_interval: Duration::from_secs(10),
-    // 5 minutes of samples at 10 s: bounds the memory and how long `start`
-    // waits behind a failing CSMS.
-    sample_queue_limit: 30,
+    // 4 hours of samples at 10 s (section 3.7: queue what an offline station
+    // would have sent), about 0.15 MB. Past it the oldest are dropped. The
+    // limit also bounds how long a StopTransaction waits behind the samples
+    // of a CSMS that keeps failing them: about 30 s per sample for CALLERRORs
+    // (3 attempts, waits of 10 s and 20 s), about 120 s when it does not
+    // answer at all (3 timeouts of 30 s as well), so up to about 12 h or
+    // 48 h. The roadmap backlog has a rule that would cut this.
+    sample_queue_limit: 1440,
 };
 
 #[tokio::main]
@@ -131,4 +137,19 @@ fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
         }
         info!("shutting down");
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_sample_queue_holds_hours_of_samples() {
+        // Section 3.7: an offline station queues what it would have sent.
+        // 30 samples were 5 minutes, which lost the samples of any ordinary
+        // outage; the queue must hold at least 4 hours.
+        let held =
+            SETTINGS.meter_sample_interval * u32::try_from(SETTINGS.sample_queue_limit).unwrap();
+        assert!(held >= Duration::from_secs(4 * 3600), "only {held:?}");
+    }
 }

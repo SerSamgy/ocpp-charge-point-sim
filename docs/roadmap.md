@@ -55,7 +55,7 @@ instead.
          every transition of a live connection; events that happen while
          offline are applied after the reconnect and reported once.
          [#15](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/15)
-5. **In progress.** Transactions: Authorize, StartTransaction,
+5. **Done.** Transactions: Authorize, StartTransaction,
    StopTransaction, MeterValues with a simulated energy meter. In three
    pull requests.
    - [x] **5a.** Simulated energy meter (constant 7.4 kW while Charging),
@@ -93,10 +93,15 @@ instead.
          the answer, a fault then clears to Finishing, and the test CSMS
          answers a repeated start with the same ID.
          [#20](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/20)
-   - [ ] **5c3.** MeterValues for the sample ticks that fall while the
-         station is offline (section 3.7), computed when the waiting inputs
-         are applied after the reconnect, at the points of the sample grid
-         between them.
+   - [x] **5c3.** MeterValues for the sample points that fall while the
+         station is offline (section 3.7): the sampler follows a grid in
+         UTC from the start of the transaction (`sample_grid`), and the
+         points of the offline time are queued when the waiting inputs are
+         applied after the reconnect, each read with the commands entered
+         before it only. Every missed point gets its own sample (it was one
+         for all of them); `sample_queue_limit` 30 → 1440 (four hours at
+         10 s).
+         [#21](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/21)
 
 ## Hardware and system track
 
@@ -184,6 +189,25 @@ Found during the migration inventory; carried over as is
       5c1, 5c2).
 - [ ] A message on which the CSMS drops the connection blocks the queue:
       a lost connection does not count as a failed attempt (step 5c1).
+- [ ] Thin out the samples of a long outage instead of dropping the
+      oldest ones when `sample_queue_limit` is reached (for example keep
+      every second one): the CSMS would see the whole outage at a coarser
+      resolution. Needs a rule in `TxQueue` that copes with a head waiting
+      for a retry (step 5c3).
+- [ ] Send the queue one message per loop iteration instead of in one go
+      (`drain`): after a long outage up to `sample_queue_limit` samples go
+      out before the status reports, and neither keyboard input nor
+      Heartbeat is polled meanwhile (about 2.4 minutes for 1440 samples at
+      100 ms per CALL) (step 5c3).
+- [ ] A CSMS that keeps failing MeterValues holds back a StopTransaction
+      for up to about 12 h (CALLERROR) or 48 h (no answer) at
+      `sample_queue_limit` 1440. A rule could drop the samples of a
+      transaction that wait before its Stop once one of them was
+      discarded (step 5c3).
+- [ ] A StopTransaction can carry an earlier time and a lower `meterStop`
+      than a sample already taken: the keyboard thread stamps `at` before
+      it sends, so a sample may be taken for a point after it, and a clock
+      set back does the same (step 5c3).
 - [ ] Retry a transaction message with the same message ID (OCPP-J 1.6
       errata 3.1 allows it), so a CSMS can tell a retry from a new message;
       today every CALL gets a new UUID (step 5c1).
@@ -226,6 +250,11 @@ Found during the migration inventory; carried over as is
       once, so a Pi that starts before NTP has synchronised (autostart,
       step 10) reports a wrong time for the untouched initial state on
       every report until the program restarts.
+      Since step 5c3 the sample grid is also tied to the wall clock, where
+      the tokio interval it replaced was monotonic: a clock stepped forward
+      during a transaction gives a burst of up to `sample_queue_limit`
+      samples with invented times, one stepped back a pause of the same
+      length.
 - [ ] StatusNotification `info` for an EV-side disconnect (`EV side
       disconnected`, 1.6 section 4.9, `StopTransactionOnEVSideDisconnect`):
       needs a reason in the Finishing state; today Unplug while Charging
