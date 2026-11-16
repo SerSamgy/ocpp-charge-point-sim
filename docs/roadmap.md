@@ -75,6 +75,7 @@ instead.
          `TransactionMessageRetryInterval` (10 s), section 3.7.1; discard
          after the last attempt; at most 30 samples wait. Replaces
          `pending_stop`. `start` waits for an empty queue.
+         [#19](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/19)
    - [ ] **5c2.** StartTransaction through the queue: the transaction
          starts on the station right after Authorize Accepted, and its
          messages carry `transactionId` -1 if StartTransaction was never
