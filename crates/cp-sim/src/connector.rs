@@ -138,6 +138,27 @@ impl State {
     }
 }
 
+impl State {
+    /// The state once charging is no longer allowed because the CSMS took
+    /// the authorization back (errata 3.17): Charging becomes Finishing, and
+    /// a fault that would resume Charging resumes Finishing instead, so
+    /// clearing it does not charge without a transaction. Every other state
+    /// stays as it is.
+    pub fn without_charging(self) -> State {
+        match self {
+            State::Charging => State::Finishing,
+            State::Faulted {
+                fault,
+                resume: Resume::Charging,
+            } => State::Faulted {
+                fault,
+                resume: Resume::Finishing,
+            },
+            other => other,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +403,29 @@ mod tests {
                 since
             }
         );
+    }
+
+    #[test]
+    fn without_charging_never_charges_and_changes_nothing_else() {
+        for state in all_states() {
+            let after = state.without_charging();
+            match state {
+                State::Charging => assert_eq!(after, State::Finishing),
+                State::Faulted {
+                    fault,
+                    resume: Resume::Charging,
+                } => assert_eq!(
+                    after,
+                    State::Faulted {
+                        fault,
+                        resume: Resume::Finishing
+                    }
+                ),
+                other => assert_eq!(after, other),
+            }
+            // Neither now nor after clearing the fault.
+            assert_ne!(after, State::Charging);
+            assert_ne!(after.on(Event::ClearFault), Ok(State::Charging));
+        }
     }
 }
