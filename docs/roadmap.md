@@ -69,6 +69,7 @@ instead.
          register; no `transactionData` in StopTransaction (as if
          `StopTxnSampledData` and `StopTxnAlignedData` were empty, section
          3.16.5).
+         [#18](https://github.com/SerSamgy/ocpp-charge-point-sim/pull/18)
    - [ ] **5c.** A queue of transaction-related messages with
          `TransactionMessageAttempts` and `TransactionMessageRetryInterval`
          (section 3.7), and a transaction whose ID is not known yet
