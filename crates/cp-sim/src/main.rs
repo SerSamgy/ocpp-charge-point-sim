@@ -17,13 +17,6 @@ mod frame;
 mod keyboard;
 mod logging;
 mod meter;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the session sends MeterValues from a later commit on"
-    )
-)]
 mod ocpp16;
 mod pending;
 mod session;
@@ -31,13 +24,6 @@ mod status16;
 #[cfg(test)]
 mod test_support;
 mod timestamp;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the session sends MeterValues from a later commit on"
-    )
-)]
 mod transaction16;
 
 use std::{io, time::Duration};
@@ -64,6 +50,9 @@ const SETTINGS: Settings = Settings {
     },
     boot_retry: boot::DEFAULT_BOOT_RETRY,
     close_timeout: Duration::from_secs(5),
+    // MeterValueSampleInterval. Real stations use 1 to 5 minutes (1.6
+    // section 3.16.1); 10 s shows the progress quickly when trying it out.
+    meter_sample_interval: Duration::from_secs(10),
 };
 
 #[tokio::main]
