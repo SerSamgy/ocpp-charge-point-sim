@@ -38,7 +38,8 @@ Layout:
   repository.
 - `docs/decisions/`: ADRs (architecture decision records). Read the
   relevant ones before changing what they cover.
-- `docs/hardware/`: pin table and wiring notes.
+- `docs/hardware/`: pin table, wiring notes and the hardware steps
+  protocol (`protocol.md`).
 
 ## Communication
 
@@ -144,8 +145,16 @@ glossary.
   (e.g. an Arduino Uno) directly.
 - No mains voltage in this project. If a task would involve it, stop and
   say so.
-- Before running anything on the Pi (`just deploy`, `ssh`), say what will
-  happen physically.
+- Before running anything on the Pi (`just deploy`, `ssh`), say in one
+  line what it does and what will happen physically.
+- Never escalate privileges on the Pi over `ssh` (`sudo`, `su`, `doas`,
+  root login). Never write to a serial port directly (shell redirection,
+  `echo`, terminal programs); running project code that talks to a serial
+  port is class A in `docs/hardware/protocol.md`.
+- A task that touches hardware (wiring, Pi OS configuration, running code
+  that drives pins or serial ports) follows `docs/hardware/protocol.md`:
+  read it before planning. After asking for a physical action, end the
+  turn and wait for the owner's report.
 
 ## Purchases
 
