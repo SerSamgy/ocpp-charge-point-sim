@@ -105,6 +105,9 @@ instead.
 
 ## Hardware and system track
 
+Every step of this track follows `docs/hardware/protocol.md`; its plan
+contains a checklist for the step, with sources.
+
 6. **Done.** LED on GPIO via `rppal`. Imported in `f922c90`.
 7. **Done.** Four buttons, debouncing, polling vs interrupts. See
    `docs/hardware/`. Imported in `f922c90`.
