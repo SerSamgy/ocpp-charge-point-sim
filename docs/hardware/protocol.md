@@ -216,7 +216,7 @@ actions: waiting for the owner is part of the evening.
 - Committed, in `docs/hardware/`: the pin table with BCM and physical
   numbers, wiring, measurements, the date of each check, and a link to
   the official page every figure comes from. The journal is private and
-  its entries are never referenced from the repository, so a fact that only lives there
-  is lost to the next session and to the reviewers.
+  its entries are never referenced from the repository, so a fact that
+  only lives there is lost to the next session and to the reviewers.
 - The journal (`docs/journal/`, Russian, `CLAUDE.md`): the narrative,
   observations, mistakes and what was learned.
