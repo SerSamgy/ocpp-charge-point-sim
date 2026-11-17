@@ -87,6 +87,14 @@ not there, report that instead of answering from memory.
    `.github/workflows/`) are necessary and called out; a new OCPP
    message gets a handler in `csms/` and an end-to-end check; hardware
    steps follow the safety rules in `CLAUDE.md`.
+7. **Hardware steps.** If the plan touches hardware, read
+   `docs/hardware/protocol.md` and check against it: the owner's physical
+   actions are listed separately; the plan has a section "Checklist for
+   this step, with sources" whose figures come from official
+   documentation; no class P change comes without a recovery path; no
+   class A command comes without a stop-and-wait; wiring ends with the
+   wiring checkpoint; wiring, boot configuration and code are not mixed
+   in one step.
 
 ## Output
 
