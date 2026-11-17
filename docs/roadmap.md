@@ -303,7 +303,8 @@ Found during the migration inventory; carried over as is
   - [ ] whether a tty echoes what it receives so that a plain `cat` of a
         console would write into it (`stty -echo raw` first);
   - [ ] what `rppal` does with a pin when the process is killed by a
-        signal (it resets pins on `Drop`);
+        signal (`rppal` is believed to reset pins on `Drop`; not
+        verified);
   - [ ] whether the first user of the Pi has `sudo` without a password;
   - [ ] the checklist for each step (8, 9, 10, relay, Control Pilot) is
         written in the plan of that step, with sources.

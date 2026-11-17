@@ -101,8 +101,9 @@ checked by observation, and a reset is a command of class A of its own.
 `just deploy` only copies a file and is not class A; running the copy
 is.
 
-**P, persistent.** Boot files (`/boot/firmware/config.txt`,
-`cmdline.txt`), systemd units, packages, users, network, reboot and
+**P, persistent.** Boot files (`config.txt`, `cmdline.txt`; their path
+depends on the OS release, confirm it from the documentation), systemd
+units, packages, users, network, reboot and
 shutdown. The owner runs these. The agent supplies the exact commands,
 the backup, the diff and the way back. The agent never escalates
 privileges on the Pi over `ssh` (`sudo`, `su`, `doas`, root login): the
@@ -173,7 +174,7 @@ Further rules for class P:
 
 For every output the plan states what it is during boot, after the
 program exits, and after a crash, and that is checked by observation.
-Pins that float during boot, relays and anything driving a load need
+Pins that may float during boot, relays and anything driving a load need
 this most. At the end of every session the outputs are in their safe
 state and nothing runs under load unattended.
 
@@ -215,7 +216,7 @@ actions: waiting for the owner is part of the evening.
 - Committed, in `docs/hardware/`: the pin table with BCM and physical
   numbers, wiring, measurements, the date of each check, and a link to
   the official page every figure comes from. The journal is private and
-  never referenced from the repository, so a fact that only lives there
+  its entries are never referenced from the repository, so a fact that only lives there
   is lost to the next session and to the reviewers.
 - The journal (`docs/journal/`, Russian, `CLAUDE.md`): the narrative,
   observations, mistakes and what was learned.
