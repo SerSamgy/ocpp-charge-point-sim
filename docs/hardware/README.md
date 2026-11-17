@@ -3,6 +3,9 @@
 Raspberry Pi 5. Pin numbers are BCM (GPIO numbers of the chip, not the
 physical header pins), as used by `rppal` in `crates/cp-blink`.
 
+How a task that touches hardware runs (who does what, when the agent
+stops, what needs approval): [`protocol.md`](protocol.md).
+
 | Function | GPIO | Mode |
 |---|---|---|
 | LED | 17 | output |

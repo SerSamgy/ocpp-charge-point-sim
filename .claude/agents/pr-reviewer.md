@@ -88,6 +88,13 @@ finding again unless you have a new argument, and then say what is new.
    `justfile`, `.githooks/`, `.github/workflows/`) are needed by the
    task; nothing committed references the journal; committed text is
    English.
+7. **Hardware steps.** If the branch touches hardware, check against
+   `docs/hardware/protocol.md`: the pull request's "How to verify" lists
+   the physical checks the owner runs, and their results are marked as
+   reported by the owner; pin and wiring facts are in `docs/hardware/`
+   with the date of the check and a source link, not only in the journal;
+   hardware access is behind a thin layer with the logic tested without
+   hardware.
 
 ## Output
 

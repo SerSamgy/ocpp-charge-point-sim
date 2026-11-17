@@ -111,6 +111,13 @@ findings directly; `pr-reviewer` writes in English. A run with a
 blocker or should fix is followed by another one, at most three per
 plan or push (`CLAUDE.md`, Workflow).
 
+Both also check hardware tasks against `docs/hardware/protocol.md`
+(checklist point 7 of each). The protocol is a process that nothing in
+the tooling enforces, so these two checks are what notices a missing
+checklist section, a persistent change on the Pi without a recovery
+path, or wiring facts kept only in the private journal. Neither
+subagent can reach the Pi: `ssh` is not on the hook's list.
+
 | Subagent | When | Tools | Model, effort |
 |---|---|---|---|
 | `plan-reviewer` | before a plan is presented | `Read`, `Grep`, `Glob` | `opus`, `medium` |
