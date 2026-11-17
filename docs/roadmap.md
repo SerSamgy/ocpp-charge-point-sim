@@ -119,7 +119,9 @@ contains a checklist for the step, with sources.
 
 ## Suggested order
 
-8 → 5 → 10; 9 at any time.
+8 → 9 → 10 (step 5 is done). 9 comes before 10: the serial console is a
+way into the Pi when an autostart service or a boot file breaks it, and
+the Pi has a single SD card.
 
 ## Larger blocks after that
 
@@ -286,6 +288,25 @@ Found during the migration inventory; carried over as is
       CSMS URL: it lives in `main`, so move it into a testable function
       first.
 - [ ] Extract an `ocpp-proto` library crate (see `docs/archive/`).
+- [ ] Add the physical header pin numbers to the pin table in
+      `docs/hardware/README.md` (`CLAUDE.md` asks for BCM and physical
+      numbers; the table has BCM only). Check them against the official
+      Raspberry Pi documentation.
+- [ ] Hardware protocol (`docs/hardware/protocol.md`), to settle in the
+      first hardware pull request, against the official documentation, and
+      to record in `docs/hardware/` with links:
+  - [ ] how to tell that the Pi 5 is powered off (the LEDs after a
+        shutdown, the 5 V pin while the cable is in);
+  - [ ] step 9: which connector and which UART the console of the Pi 5
+        and the Debug Probe use, whether `config.txt` needs a change (a
+        class P change), and the device name on the laptop;
+  - [ ] whether a tty echoes what it receives so that a plain `cat` of a
+        console would write into it (`stty -echo raw` first);
+  - [ ] what `rppal` does with a pin when the process is killed by a
+        signal (it resets pins on `Drop`);
+  - [ ] whether the first user of the Pi has `sudo` without a password;
+  - [ ] the checklist for each step (8, 9, 10, relay, Control Pilot) is
+        written in the plan of that step, with sources.
 - [ ] Turn `cp-blink` into a hardware library (pin table, `Button`,
       debounce) with the experiments as examples.
 - [ ] Validate serialized messages against the official JSON schemas in
@@ -316,7 +337,14 @@ Found during the migration inventory; carried over as is
         network limits for shell commands);
   - [ ] close short-form gaps: `git push -fu`, `+refspec` pushes,
         `git branch -D`, `git switch -f`, `git commit -vn`;
-  - [ ] ask or deny `rsync`, `sftp`, `uv remove|sync`;
+  - [ ] ask or deny `rsync`, `sftp`, `uv remove|sync`; for the hardware
+        protocol (`docs/hardware/protocol.md`) also ask for `picocom`,
+        `minicom`, `screen`, `tio`, `stty`, `dd`, `ssh-keygen`,
+        `ssh-copy-id` and the bare `just deploy` (the rule `just deploy *`
+        may not match it), and check whether `Read(//dev/**)` should ask
+        or be denied (what Claude Code does for a read outside the
+        project is not verified). An ask rule beats a broad allow in
+        `.claude/settings.local.json`, which is where it pays off;
   - [ ] check how the Code tab of Claude Desktop applies the rules
         (manual checklist in the pull request that added them).
 - [ ] CI follow-ups, see `docs/decisions/0006-ci-on-github-actions.md`:
